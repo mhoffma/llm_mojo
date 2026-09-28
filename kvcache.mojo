@@ -1,21 +1,29 @@
-"""KV cache storage formats.
+"""KV cache storage formats, and the attention that reads them.
 
 The KV cache holds, for every layer, each past token's key and value vectors:
 [layer, position, head, head_dim]. Attention compares the new token's query
-with every cached key (`score`) and adds up the cached values weighted by the
-softmax of those scores (`add_value`). How keys and values are stored is a
-format, like the weights' (tensor.WeightMatrix): the attention kernel is
-generic over the `KVCache` trait and each format's methods are inlined into
-it.
+with every cached key and adds up the cached values weighted by the softmax
+of those scores. How keys and values are stored is a format, like the
+weights' (tensor.WeightMatrix), and so is how attention computes with them:
 
-Formats (PLAN.md, milestone M5):
-- DenseKV[dtype]: float32 (the original cache), float16, bfloat16.
-- QuantKV[BITS]: int16 / int8 with a scale per (layer, position, head).
+- `KVCache`: what the model needs from any cache: create, store a token,
+  `attend` (compute attention), nbytes, free.
+- `FloatKV(KVCache)`: caches read in float32 through `score` (q · k) and
+  `add_value` (acc += p * v). They share one attention implementation,
+  `attend_float`, the original float32 attention (bit-identical).
+  - DenseKV[dtype]: float32 (the original cache), float16, bfloat16.
+  - QuantKV[BITS]: int16 / int8 with a scale per (layer, position, head).
+- IntAttnKV (int_attention.mojo): int8 keys and values in layouts built for
+  VNNI, with attention computed in integers.
+
+The model calls kernels.attention the same way for every format; only the
+cache type it is instantiated with differs.
 """
 
-from std.math import round
+from std.math import round, exp, sqrt
 from std.memory.alloc import unsafe_alloc
 from std.sys import size_of
+from max.algorithm import parallelize
 
 from tensor import FPtr, NW, F32V
 
@@ -42,6 +50,27 @@ trait KVCache(Deinitable, ImplicitlyCopyable):
         values each) at `pos` of `layer`."""
         ...
 
+    def attend[
+        N_HEAD: Int, HS: Int
+    ](self, out_: FPtr, qkv: FPtr, layer: Int, T: Int, pos0: Int):
+        """Causal attention for T new tokens at positions pos0.. of `layer`:
+        queries from qkv ([T, 3C]), keys and values from this cache (which
+        already holds positions 0 .. pos0+T-1), float32 output [T, C]."""
+        ...
+
+    def nbytes(self) -> Int:
+        """Bytes of storage, to report."""
+        ...
+
+    def free(self):
+        """Releases the storage."""
+        ...
+
+
+trait FloatKV(KVCache):
+    """A cache that attention reads in float32, one position and head at a
+    time. Such formats implement `attend` with `attend_float`."""
+
     def score[HS: Int](self, layer: Int, pos: Int, head: Int, q: FPtr) -> Float32:
         """Returns q · k for the key at (layer, pos, head); q has HS values.
         """
@@ -60,16 +89,62 @@ trait KVCache(Deinitable, ImplicitlyCopyable):
         """acc += p * v for the value at (layer, pos, head)."""
         ...
 
-    def nbytes(self) -> Int:
-        """Bytes of storage, to report."""
-        ...
 
-    def free(self):
-        """Releases the storage."""
-        ...
+def attend_float[
+    KV: FloatKV, //, N_HEAD: Int, HS: Int
+](kv: KV, out_: FPtr, qkv: FPtr, layer: Int, T: Int, pos0: Int):
+    """Float32 attention through FloatKV's score / add_value: the original
+    attention kernel, moved here unchanged."""
+    comptime C = N_HEAD * HS
+    var scale = 1 / sqrt(Float32(HS))
+
+    def head_query(idx: Int) {imm}:
+        var h = idx % N_HEAD
+        var t = idx // N_HEAD
+        var npos = pos0 + t + 1
+        var q = qkv.unsafe_offset(t * 3 * C + h * HS)
+        var scores = unsafe_alloc[Float32](npos)
+        var mx = Float32.MIN
+        for s in range(npos):
+            var sc = kv.score[HS](layer, s, h, q) * scale
+            scores[unsafe_offset=s] = sc
+            mx = max(mx, sc)
+        # Exponentials 16 at a time: SIMD exp gives exactly the scalar
+        # results lane by lane, and it's ~14x faster than one exp per call
+        # (research/test_softmax.mojo). The sum stays in the original order,
+        # so float32 results are unchanged bit for bit.
+        var s0 = 0
+        var mv = F32V(mx)
+        while s0 + NW <= npos:
+            scores.unsafe_store(s0, exp(scores.unsafe_load[width=NW](s0) - mv))
+            s0 += NW
+        while s0 < npos:
+            scores[unsafe_offset=s0] = exp(scores[unsafe_offset=s0] - mx)
+            s0 += 1
+        var total = Float32(0)
+        for s in range(npos):
+            total += scores[unsafe_offset=s]
+        var o = out_.unsafe_offset(t * C + h * HS)
+        var acc = Array[F32V, length = HS // NW](fill=F32V(0))
+        for s in range(npos):
+            var p = F32V(scores[unsafe_offset=s] / total)
+            kv.add_value[HS](layer, s, h, p, acc)
+        comptime for i in range(HS // NW):
+            o.unsafe_store(i * NW, acc[i])
+        scores.unsafe_free()
+
+    # Waking the worker threads costs more than a short-context decode step's
+    # attention, so only go parallel when there is enough work.
+    if T * (pos0 + T) < 256:
+        for i in range(N_HEAD * T):
+            head_query(i)
+    else:
+        parallelize(head_query, N_HEAD * T)
 
 
-struct DenseKV[dtype: DType](KVCache):
+
+
+struct DenseKV[dtype: DType](FloatKV):
     """Keys and values stored as `dtype`, widened to float32 when read.
 
     With float32 this is the original cache, doing exactly the same
@@ -151,6 +226,11 @@ struct DenseKV[dtype: DType](KVCache):
         comptime for i in range(HS // NW):
             acc[i] = p.fma(vp.unsafe_load[width=NW](i * NW).cast[DType.float32](), acc[i])
 
+    def attend[
+        N_HEAD: Int, HS: Int
+    ](self, out_: FPtr, qkv: FPtr, layer: Int, T: Int, pos0: Int):
+        attend_float[N_HEAD, HS](self, out_, qkv, layer, T, pos0)
+
     def nbytes(self) -> Int:
         return 2 * self.n_layer * self.max_t * self.dim * size_of[Scalar[Self.dtype]]()
 
@@ -159,7 +239,7 @@ struct DenseKV[dtype: DType](KVCache):
         self.v.unsafe_free()
 
 
-struct QuantKV[BITS: Int](KVCache):
+struct QuantKV[BITS: Int](FloatKV):
     """Keys and values as BITS-bit signed integers (16 or 8), with one float32
     scale per (layer, position, head) for keys and one for values.
 
@@ -282,6 +362,11 @@ struct QuantKV[BITS: Int](KVCache):
         var ps = p * F32V(self.vs[unsafe_offset=sl])
         comptime for i in range(HS // NW):
             acc[i] = ps.fma(vp.unsafe_load[width=NW](i * NW).cast[DType.float32](), acc[i])
+
+    def attend[
+        N_HEAD: Int, HS: Int
+    ](self, out_: FPtr, qkv: FPtr, layer: Int, T: Int, pos0: Int):
+        attend_float[N_HEAD, HS](self, out_, qkv, layer, T, pos0)
 
     def nbytes(self) -> Int:
         var n = self.n_layer * self.max_t * self.n_head

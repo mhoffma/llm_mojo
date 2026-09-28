@@ -51,7 +51,7 @@ accuracy each format costs for that speed**.
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
-| M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) | 🔄 steps 1-3 and 5 done: int8 cache (now the default for quantized models) +10-16% long-context decode, +11-23% prompt, ~0.001 KL; step 4 (faster attention arithmetic) optional |
+| M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) + integer attention | ✅ done: int8 cache default for quantized models (+10-16% long-context decode); `--attention int` (integer attention on an int8 VNNI-layout cache) another +9-15% long-context decode at no accuracy cost |
 | M6. Tuning and final results table | ☐ |
 | M7. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
@@ -113,6 +113,7 @@ Options (both programs; `--dtype` only in `gpt2t`):
 | `--dtype FMT` | weight format: `f32`, `f16`, `bf16`, `int8-ch`, `int4-ch`, `int4-g128`, `int4-g64`, `int4-g32`, each int format also with `-sym` | `f32` |
 | `--head FMT` | with an int `--dtype`: format of wte (embedding + output head), `int8` or `same` | `int8` |
 | `--kv FMT` | KV cache format: `auto` (f32/f16/bf16 weights keep their type, quantized weights get `int8`), `f32`, `f16`, `bf16`, `int16`, `int8` | `auto` |
+| `--attention A` | `float`, or `int`: attention in integers (needs the int8 cache) | `float` |
 | `-m DIR` | directory with the Hugging Face files | `gpt2` |
 | `-n N` | tokens to generate | 64 |
 | `-t TEMP` | sampling temperature; `0` = greedy | 0.8 |
@@ -159,7 +160,9 @@ users can install Modular's Mojo extension.
 | `tensor.mojo` | The `WeightMatrix` trait and our formats: `DenseMatrix[dtype]`, `QuantMatrix[bits, group, symmetric, a16]` |
 | `gguf.mojo` | GGUF file reader and `GGUFMatrix`: dequantizes Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 |
 | `kernels.mojo` | matmul (prefill), GEMV (decode), `matmul_rows` for `[OUT, IN]` weights, LayerNorm, attention, output head; generic over `W: WeightMatrix` |
-| `kvcache.mojo` | The `KVCache` trait and its formats: `DenseKV[dtype]`, `QuantKV[bits]` |
+| `kvcache.mojo` | The `KVCache` / `FloatKV` traits, float attention (`attend_float`), and `DenseKV[dtype]`, `QuantKV[bits]` |
+| `int_attention.mojo` | `IntAttnKV`: int8 cache in VNNI layouts with integer attention |
+| `intmath.mojo` | Integer `masked_exp` / `masked_softmax` in fixed point |
 | `tokenizer.mojo` | GPT-2 byte-level BPE tokenizer (reads `vocab.json`, `merges.txt`) |
 | `tests/` | Correctness checks and the accuracy harness's reference (see below); `tests/data/` holds the evaluation text |
 | `research/` | Small commented probe programs, each answering one question; see `research/README.md` |
@@ -180,6 +183,8 @@ users can install Modular's Mojo extension.
 | Our quantizer matches NumPy | add `--quant 4,32,0` (bits, group, symmetric) to the reference; compare with `--dtype int4-g32` | same to ~6 digits |
 | GGUF dequantization matches llama.cpp's Python `gguf` | `uv run --with gguf python tests/gguf_check.py gpt2/gguf/gpt2.Q4_K_M.gguf` (runs `tests/gguf_dump.mojo`) | relative error ≤ 1e-5 (measured ~4e-8 for all six block formats) |
 | Integer (A16) kernels match exact math | `uv run mojo run -I . tests/a16_kernels.mojo` | `PASS` (max relative error ≤ 1e-5; measured ~1.6e-7) |
+| Integer softmax (`intmath.masked_softmax`) | `uv run mojo run -I . tests/int_softmax.mojo` | `PASS` (SIMD == scalar, max error ≤ 1e-4; measured 4.3e-5) |
+| Integer attention matches exact math on the same quantized data | `uv run mojo run -I . tests/int_attention_check.mojo` | `PASS` (≤ 5e-3 of the output; measured 4.1e-4) |
 | A16 perplexity matches NumPy | `uv run --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --quant 4,32,0 --quant-head 8,0,0 --act16` vs `./gpt2t_bin --dtype int4-g32-a16 --ppl tests/data/alice_ch1.txt` | same to ~1e-4 relative (int16 rounding flips; see M4) |
 | GGUF perplexity matches NumPy | `uv run --with gguf --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --gguf FILE` vs `./gpt2t_bin --gguf FILE --ppl tests/data/alice_ch1.txt` | same to ~6 digits |
 
@@ -594,6 +599,64 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.f
    exponentials were only a few percent of decode time, and the `q · k`
    scores and value sums are most of attention's cost: measure with step 5
    first.)
+
+**Step 4 done as full integer attention (2026-09-28)** (`--attention int`):
+
+- **Modular structure.** Attention now belongs to the cache format:
+  `KVCache.attend[N_HEAD, HS](out, qkv, layer, T, pos0)`. The model and
+  `kernels.attention` call it the same way for every format; only the cache
+  type differs at instantiation.
+  - `FloatKV(KVCache)`: caches read in float32 through `score` /
+    `add_value` (DenseKV, QuantKV). Their `attend` is the shared
+    `kvcache.attend_float`, the original float attention moved unchanged
+    (float32 still bit-identical).
+  - `IntAttnKV` (`int_attention.mojo`): int8 keys and values in VNNI
+    layouts, attention in integers.
+  - `--kv int8 --attention int` (or `--attention int` with quantized
+    weights, whose default cache is int8) selects `IntAttnKV`; other caches
+    with `--attention int` are an error. The name shows `+kv-int8-intattn`.
+- **`intmath.mojo`**: `masked_exp` (unnormalized softmax: e_i in Q30,
+  the largest exactly 1.0, plus their sum) and `masked_softmax` =
+  masked_exp + normalization to Q15; additive mask with a -inf sentinel;
+  positions >= n masked, so padded buffers work.
+- **The integer attention** (per token and head; details in the module
+  docstring):
+  1. query → int16 (scale per head);
+  2. scores: keys int8 stored `[pos / 16][d / 2][16][2]` per head, so one
+     broadcast query pair and one VPDPWSSD add 2 dimensions to 16
+     positions' scores (int8 keys: at most 2.7e8, no overflow);
+  3. one shared scale: scores rescaled with integer multipliers (key scale
+     as `kq = sk * 2^24`, query scale as `qm = sq / 8 * 2^40`) to fixed
+     point with 16 fraction bits;
+  4. `masked_exp`;
+  5. weights `w = e * vq / vq_max >> 15` (int16) with the value scales
+     folded in; values int8 stored `[pos / 2][d][2]`, so one broadcast
+     weight pair and one VPDPWSSD add 2 positions to 16 dimensions; int32
+     sums move to float every 256 positions (256 × 32767 × 127 < 2^31);
+  6. `out = sums * (vq_max / 2^24) * 2^15 / Σe`: normalization and value
+     scale in one float multiply per output (the next matmul takes float).
+- **A precision lesson**: the first version normalized to Q15 probabilities
+  before the value sum. With flat attention over ~1000 positions each
+  probability had only ~30 Q15 steps, and outputs were off by up to 1.8%.
+  Keeping the unnormalized e (largest = 1.0), deriving the int16 weights
+  relative to it, and dividing by Σe at the end (as flash attention does)
+  cut the worst error to 4.1e-4.
+- **Tests**: `tests/int_softmax.mojo` (masked_softmax: SIMD == scalar in
+  42 cases incl. odd lengths, max error 4.3e-5, padding 0) and
+  `tests/int_attention_check.mojo` (attention vs exact float64 on the same
+  quantized data, decode and prefill, up to 1003 positions: worst error
+  4.1e-4 of the output's magnitude).
+- **Accuracy** (`tests/compare.sh`): float32 weights + int8 cache: KL
+  3.19e-4 (float attention) → 3.48e-4 (integer); int4-g32-a16: 0.148 both.
+- **Speed** (int4-g32-a16, int8 cache, 3 interleaved rounds, load 3-6):
+
+  | attention | prompt, 476 | decode after 476 | prompt, ~900 | decode after ~900 |
+  |---|---|---|---|---|
+  | float | 934 | 124 | 898 | 113 |
+  | integer | 978 (+5%) | 135 (+9%) | 969 (+8%) | 130 (+15%) |
+
+- Build time is now ~100 s (the integer cache is one more instantiation
+  per weight format).
 
 **Softmax (2026-09-28, between steps 3 and 4).**
 - `research/test_softmax.mojo`: an integer `masked_softmax`

@@ -169,6 +169,7 @@ Timing and model size are printed to stderr after the generated text.
 | `--dtype FMT` | weight format of the layer matrices (see below) | `f32` |
 | `--head FMT` | with an int `--dtype`: format of `wte` (embedding + output head), `int8` or `same` | `int8` |
 | `--kv FMT` | KV cache format: `auto` (f32/f16/bf16 weights keep their type, quantized weights get int8), `f32`, `f16`, `bf16`, `int16`, `int8` (see [KV cache](#the-kv-cache)) | `auto` |
+| `--attention A` | `float`, or `int`: attention computed in integers (needs the int8 cache; see [integer attention](#integer-attention)) | `float` |
 | `--gguf FILE` | use a llama.cpp GGUF file of GPT-2 124M, as stored; overrides `--dtype` | |
 | `-m DIR` | directory with `model.safetensors`, `vocab.json`, `merges.txt` | `gpt2` |
 | `-n N` | tokens to generate | 64 |
@@ -249,6 +250,27 @@ These results are verified against NumPy (`tests/reference.py --kv`).
 The smaller the cache, the less memory attention reads per token, and the gain grows with the context: int8 is 16% faster than f32 for decode after ~900 tokens, and 23% faster for the prompt.
 
 Note: the int and GGUF results in the tables above were measured with a float32 cache, before the int8 default existed. `--kv f32` reproduces them.
+
+### Integer attention
+
+Attention belongs to the cache format: `KVCache.attend(...)`. The model code and `kernels.attention` call it the same way for every format, and only the type the model is instantiated with differs:
+
+- **Float caches** (`FloatKV`: DenseKV, QuantKV) share the original float32 attention, `kvcache.attend_float`.
+- **`IntAttnKV`** (`int_attention.mojo`, selected with `--attention int` on the int8 cache) stores int8 keys and values in layouts built for VNNI and computes attention in integers. Per token and head:
+  1. The query is quantized to int16.
+  2. Keys are stored 16 positions per register, in pairs along the head dimension, so one broadcast query pair and one `VPDPWSSD` advance 16 positions' scores.
+  3. Scores are rescaled with integer multipliers into one shared fixed-point scale, since each key has its own scale.
+  4. `intmath.masked_exp`, the integer softmax without its normalization (`e^x = 2^(x·log2 e)`: a shift for the integer part, a degree-3 polynomial for the fraction), gives weights whose largest is exactly 1.0.
+  5. Values are stored in position pairs, so one `VPDPWSSD` adds two positions' contributions to 16 dimensions.
+  6. The output is divided by the sum of the weights once at the end, in the float multiply that converts the result for the next matmul.
+
+  Normalizing at the end rather than first keeps the weights precise when attention is spread over many positions. The first version, which normalized to 16-bit probabilities first, was off by up to 1.8% over ~1,000 flat positions; this one is within 4×10⁻⁴.
+
+**Cost and gain** (int4-g32-a16, int8 cache):
+- **Accuracy:** unchanged (KL 0.148 either way). With float32 weights, integer attention adds 3×10⁻⁵ KL.
+- **Speed:** decode is 9% faster after 476 tokens and 15% after ~900 (135 and 130 tok/s against 124 and 113). Prompt processing is 5–8% faster.
+
+`intmath.masked_softmax` (with normalization, 16-bit output) is also available on its own. It's tested in `tests/int_softmax.mojo`, and integer attention in `tests/int_attention_check.mojo`.
 
 ### The `WeightMatrix` trait
 
@@ -402,6 +424,7 @@ Build `gpt2t_bin` (and `gpt2_bin` for the first check) before running these:
 | GGUF dequantization matches llama.cpp's Python `gguf` package | `uv run --with gguf python tests/gguf_check.py gpt2/gguf/gpt2.Q4_K_M.gguf` |
 | GGUF perplexity matches NumPy | `uv run --with gguf --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --gguf FILE` |
 | Integer kernels match exact float64 math, including worst-case overflow inputs | `uv run mojo run -I . tests/a16_kernels.mojo` |
+| Integer softmax and integer attention match exact math | `uv run mojo run -I . tests/int_softmax.mojo`, `tests/int_attention_check.mojo` |
 | Tokenizer matches `tiktoken` | `uv run --with tiktoken python tests/tokenizer_vs_tiktoken.py` |
 
 Current results:
@@ -426,7 +449,9 @@ Current results:
 | `tensor.mojo` | The `WeightMatrix` trait, `DenseMatrix`, `QuantMatrix`, `dot_pairs` (VNNI) |
 | `gguf.mojo` | GGUF reader, `GGUFMatrix`, SIMD dequantizers for six block formats |
 | `kernels.mojo` | matmul, GEMV, `matmul_rows`, `matmul_rows_a16`, register tiles, LayerNorm, attention, output head |
-| `kvcache.mojo` | The `KVCache` trait and its formats, `DenseKV` and `QuantKV` |
+| `kvcache.mojo` | The `KVCache` / `FloatKV` traits, the float attention, `DenseKV` and `QuantKV` |
+| `int_attention.mojo` | `IntAttnKV`: int8 cache in VNNI layouts, integer attention |
+| `intmath.mojo` | Integer `masked_exp` / `masked_softmax` in fixed point |
 | `tokenizer.mojo` | GPT-2 byte-level BPE tokenizer |
 | `gpt2.mojo` | The original single-file float32 program: the frozen reference |
 | `tests/` | NumPy reference, tokenizer check, GGUF checks, kernel tests, baseline comparison, benchmark script, evaluation text |
@@ -446,7 +471,7 @@ Mojo 1.1 differs a lot from older Mojo, which most online examples use. `PLAN.md
 | M2. Accuracy harness | done |
 | M3. float16 / bfloat16, own int8 / int4 with int8 head, GGUF, fast kernels | done |
 | M4. int16 activations with integer VNNI kernels (W4A16 / W8A16) | done |
-| M5. Pluggable KV cache formats: f32 / f16 / bf16 / int16 / int8, matched to the model's precision by default | in progress |
+| M5. Pluggable KV cache formats matched to the model's precision, and integer attention | done |
 | M6. Tuning: faster output head, fewer thread wake-ups per token | next |
 | M7. Stretch: save pre-quantized weights, int8 activations (VPDPBUSD) | planned |
 

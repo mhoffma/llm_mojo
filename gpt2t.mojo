@@ -26,6 +26,8 @@ Usage:
     --kv FMT     KV cache format: auto (default: f32/f16/bf16 for those
                  weights, int8 for quantized ones), f32, f16, bf16, int16,
                  int8
+    --attention  float (default) or int: attention in integers (int8 cache
+                 in VNNI layouts, integer softmax; int_attention.mojo)
     --gguf FILE  use the weights in a llama.cpp GGUF file of GPT-2 124M
                  (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 tensors), as
                  stored; overrides --dtype. The tokenizer still comes from -m.
@@ -49,6 +51,7 @@ from tensor import FPtr, NW, F32V, WeightMatrix, DenseMatrix, QuantMatrix
 from max.algorithm import parallelize
 from kernels import linear, head, layernorm, attention, MAX_PARTS
 from kvcache import KVCache, DenseKV, QuantKV
+from int_attention import IntAttnKV
 from gguf import GGUFFile, GGUFMatrix, BPtr, GGML_F32, type_name
 from tokenizer import Tokenizer, parse_uint, read_file_bytes
 
@@ -541,6 +544,7 @@ struct Args(Movable):
     var gguf: String  # GGUF weights file; overrides --dtype
     var head: String  # output head format for int formats: int8 or same
     var kv: String  # KV cache format, or "auto" for the weights' default
+    var attention: String  # "float", or "int" (integer attention, int8 cache)
 
     def __init__(out self) raises:
         self.dtype = "f32"
@@ -556,6 +560,7 @@ struct Args(Movable):
         self.gguf = ""
         self.head = "int8"
         self.kv = "auto"
+        self.attention = "float"
         var args = argv()
         var a = 1
         while a < len(args):
@@ -576,6 +581,8 @@ struct Args(Movable):
                     self.head = val
                 elif arg == "--kv":
                     self.kv = val
+                elif arg == "--attention":
+                    self.attention = val
                 elif arg == "-m":
                     self.dir = val
                 elif arg == "-n":
@@ -897,8 +904,19 @@ def default_kv(weights: String) -> String:
 
 
 def run[W: WeightMatrix, E: WeightMatrix = W](args: Args) raises:
-    """Picks the KV cache format (--kv, or the default for W) and runs."""
+    """Picks the KV cache format (--kv, or the default for W) and the
+    attention arithmetic (--attention), and runs."""
     var kv = default_kv(W.name()) if args.kv == "auto" else args.kv
+    if args.attention == "int":
+        if kv != "int8":
+            raise Error(
+                "--attention int needs the int8 cache (--kv int8 or auto with"
+                " quantized weights), not " + kv
+            )
+        run_with[W, E, IntAttnKV](args)
+        return
+    if args.attention != "float":
+        raise Error("unknown --attention " + args.attention + " (float or int)")
     if kv == "f32":
         run_with[W, E, DenseKV[DType.float32]](args)
     elif kv == "f16":

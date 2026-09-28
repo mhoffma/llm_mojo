@@ -201,55 +201,12 @@ def attention[
 ](out_: FPtr, qkv: FPtr, kv: KV, layer: Int, T: Int, pos0: Int):
     """Causal multi-head attention for T new tokens at positions pos0.. .
 
-    Queries come from qkv ([T, 3C]); keys and values come from the KV cache
-    (any KVCache format), which already holds this layer's positions
-    0 .. pos0+T-1.
+    Queries come from qkv ([T, 3C]); keys and values come from the KV cache,
+    which already holds this layer's positions 0 .. pos0+T-1. How attention
+    is computed belongs to the cache format (KVCache.attend): float formats
+    share kvcache.attend_float, and IntAttnKV computes in integers.
     """
-    comptime C = N_HEAD * HS
-    var scale = 1 / sqrt(Float32(HS))
-
-    def head_query(idx: Int) {imm}:
-        var h = idx % N_HEAD
-        var t = idx // N_HEAD
-        var npos = pos0 + t + 1
-        var q = qkv.unsafe_offset(t * 3 * C + h * HS)
-        var scores = unsafe_alloc[Float32](npos)
-        var mx = Float32.MIN
-        for s in range(npos):
-            var sc = kv.score[HS](layer, s, h, q) * scale
-            scores[unsafe_offset=s] = sc
-            mx = max(mx, sc)
-        # Exponentials 16 at a time: SIMD exp gives exactly the scalar
-        # results lane by lane, and it's ~14x faster than one exp per call
-        # (research/test_softmax.mojo). The sum stays in the original order,
-        # so float32 results are unchanged bit for bit.
-        var s0 = 0
-        var mv = F32V(mx)
-        while s0 + NW <= npos:
-            scores.unsafe_store(s0, exp(scores.unsafe_load[width=NW](s0) - mv))
-            s0 += NW
-        while s0 < npos:
-            scores[unsafe_offset=s0] = exp(scores[unsafe_offset=s0] - mx)
-            s0 += 1
-        var total = Float32(0)
-        for s in range(npos):
-            total += scores[unsafe_offset=s]
-        var o = out_.unsafe_offset(t * C + h * HS)
-        var acc = Array[F32V, length = HS // NW](fill=F32V(0))
-        for s in range(npos):
-            var p = F32V(scores[unsafe_offset=s] / total)
-            kv.add_value[HS](layer, s, h, p, acc)
-        comptime for i in range(HS // NW):
-            o.unsafe_store(i * NW, acc[i])
-        scores.unsafe_free()
-
-    # Waking the worker threads costs more than a short-context decode step's
-    # attention, so only go parallel when there is enough work.
-    if T * (pos0 + T) < 256:
-        for i in range(N_HEAD * T):
-            head_query(i)
-    else:
-        parallelize(head_query, N_HEAD * T)
+    kv.attend[N_HEAD, HS](out_, qkv, layer, T, pos0)
 
 
 def lm_head[W: WeightMatrix, //](logits: FPtr, h: FPtr, wte: W, V: Int, C: Int):
