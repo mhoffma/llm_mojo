@@ -51,7 +51,7 @@ accuracy each format costs for that speed**.
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
-| M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) | 🔄 steps 1-2 done (all formats, `--kv`, defaults, NumPy check); step 3 (accuracy with `--compare`) next |
+| M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) | 🔄 steps 1-3 done (formats, `--kv`, accuracy: the cache is not the error source); step 4 (integer attention) next |
 | M6. Tuning and final results table | ☐ |
 | M7. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
@@ -545,9 +545,43 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.f
 
      Agreement ~1e-4 relative, like A16: coarse rounding turns tiny
      differences in computed keys into occasional different codes.
-3. Accuracy: `--ppl --compare` for each cache format, with float32 weights
+3. ✅ Accuracy: `--ppl --compare` for each cache format, with float32 weights
    (the cache's error alone) and with the quantized weight formats. The
    Alice windows reach 1,024 tokens, so the whole cache is exercised.
+   - Done (2026-09-28) with the new `tests/compare.sh "OPTIONS" ...`, which
+     runs `--ppl --compare` per configuration and prints a markdown row.
+   - The cache alone (float32 weights):
+
+     | KV cache | Perplexity | vs f32 | Top-1 vs f32 | Mean KL |
+     |---|---|---|---|---|
+     | f16 | 25.284 | −0.00% | 100.0% | 4.8e-7 |
+     | bf16 | 25.258 | −0.10% | 99.7% | 3.4e-5 |
+     | int16 | 25.284 | −0.00% | 100.0% | 5.8e-9 |
+     | int8 | 25.307 | +0.09% | 99.0% | 3.2e-4 |
+
+   - With quantized weights:
+
+     | Weights | KV | Perplexity | vs f32 | Top-1 | Mean KL |
+     |---|---|---|---|---|---|
+     | int4-g32-a16 | f32 | 25.593 | +1.22% | 75.1% | 0.147 |
+     | int4-g32-a16 | int16 | 25.590 | +1.21% | 75.1% | 0.147 |
+     | int4-g32-a16 | int8 | 25.553 | +1.06% | 75.2% | 0.148 |
+     | int8-ch-a16 | f32 | 26.117 | +3.29% | 81.7% | 0.0461 |
+     | int8-ch-a16 | int16 | 26.117 | +3.29% | 81.8% | 0.0461 |
+     | int8-ch-a16 | int8 | 26.164 | +3.48% | 81.6% | 0.0463 |
+     | GGUF Q4_K_M | f32 | 25.460 | +0.70% | 80.2% | 0.0982 |
+     | GGUF Q4_K_M | int16 | 25.460 | +0.70% | 80.2% | 0.0982 |
+     | GGUF Q4_K_M | int8 | 25.477 | +0.76% | 80.2% | 0.0982 |
+
+   - Findings: an int16 cache is exact for practical purposes (KL 6e-9
+     alone; no change with any weight format). An int8 cache adds KL
+     ~3e-4 alone and ~0.0002-0.001 on top of quantized weights, where the
+     weights contribute 0.05-0.15: the cache is not where the error comes
+     from. (int4-g32's lower perplexity with an int8 cache is noise at this
+     scale, not an improvement: its KL is slightly higher.) The per-head
+     scales are enough; GPT-2's outlier channels don't break int8 keys.
+     int16 stays the default for quantized weights; if step 5 shows a
+     worthwhile speedup, int8 is a reasonable default too.
 4. Integer attention for `-a16` models with an int16 cache (VPDPWSSD), with
    a unit test against exact math like `tests/a16_kernels.mojo`.
 5. Benchmark "decode long" with `tests/bench.sh`; update Results and the

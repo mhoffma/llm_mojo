@@ -228,7 +228,15 @@ Like the weights, the cache format is a trait, `KVCache` in `kvcache.mojo`. The 
   - `score` applies the key's scale once per dot product.
   - `add_value` folds the value's scale into the softmax weight, so there's no per-element scaling.
 
-With float32 weights, the cache format alone changes perplexity by at most 0.1%: f16 −0.002%, bf16 −0.10%, int16 0.000%, int8 +0.09%. These are verified against NumPy (`tests/reference.py --kv`).
+**Accuracy** (measured with `tests/compare.sh`; details in [`PLAN.md`](PLAN.md#m5-pluggable-kv-cache-formats)):
+- **The cache alone, with float32 weights:**
+  - int16: KL 6×10⁻⁹
+  - f16: KL 5×10⁻⁷
+  - bf16: KL 3×10⁻⁵
+  - int8: KL 3×10⁻⁴, +0.09% perplexity, 99.0% top-1 agreement
+- **With quantized weights,** an int16 cache changes nothing, and an int8 cache adds at most ~0.001 KL on top of the weights' 0.05–0.15. The cache is not where the error comes from.
+
+These results are verified against NumPy (`tests/reference.py --kv`).
 
 Note: the int and GGUF results in the tables above were measured with a float32 cache, before the int16 default existed. `--kv f32` reproduces them.
 
