@@ -16,6 +16,7 @@ Run any of them from `~/fun` with:
 | `test_softmax.mojo` | Can softmax(x + mask) run in integers (e^x as 2^x: shift plus a polynomial for the fraction), and is it accurate and fast? | Yes, accurately: degree-3 polynomial, Q15 output, rounding: max error ~1 Q15 step, KL 5.7e-4. SIMD matches scalar exactly. But on this CPU it's slower (0.88 ns/element) than a SIMD float softmax (0.40); both beat the scalar-exp float softmax attention uses now (5.8). |
 | `test_barrier.mojo` | Is a spin barrier among a persistent team of threads cheaper than starting a parallel region per operation? | Much: a parallel region costs ~23 µs of pure overhead, a spin barrier ~1 µs. (In the model, one thread per core and a spin-then-yield barrier turned out to matter too; see the README's team decode section.) |
 | `test_gelu.mojo` | Can GELU (GPT-2's tanh form) run in integers, and how accurately and fast? | Tables are accurate to ~1 Q12 step (256 KB direct: 2.5e-4; 2 KB with interpolation: 4.0e-4), but 3–4× slower (1.2–1.5 ns) than SIMD float tanh (0.40 ns). `x·σ(1.702x)` and I-BERT's i-GELU miss by ~2e-2 (they approximate the erf form). Side finding: decode's GELU used scalar tanh (3.0 ns); now vectorized. |
+| `test_head.mojo` | How fast can the output head (38.6M weights per token) go, as int8 and as GGUF Q6_K? | int8 is memory-bound: within ~15% of a plain read once its loop is unrolled and prefetches ahead (model: 1.10 → 1.00 ms). Q6_K in integers (VPDPWSSD) is ~1.7× faster than in float, but still limited by arithmetic, ~2× the read time. |
 
 Mojo concepts shown along the way:
 
@@ -36,3 +37,8 @@ Mojo concepts shown along the way:
 - `test_gelu.mojo`: lookup tables with linear interpolation in fixed point,
   lane-by-lane table reads into SIMD vectors, comparing function
   approximations against a float64 reference.
+- `test_head.mojo`: memory-bound vs compute-bound kernels, software
+  `prefetch`, `SIMD.shuffle` with a compile-time `IndexList` mask, reading
+  the assembly to see what the compiler did with it, benchmarking in
+  alternating rounds with medians, and Mojo's value lifetimes (`_ = g^`
+  keeps a value alive past its last use).

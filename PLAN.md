@@ -52,7 +52,7 @@ accuracy each format costs for that speed**.
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
 | M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) + integer attention | ✅ done: int8 cache default for quantized models (+10-16% long-context decode); `--attention int` (integer attention on an int8 VNNI-layout cache) another +9-15% long-context decode at no accuracy cost |
-| M6. Tuning and final results table | 🔄 profiling, vectorized KV store, one-region team decode (+~40% decode), vectorized decode GELU done; output head and clean results run next |
+| M6. Tuning and final results table | 🔄 profiling, vectorized KV store, one-region team decode (+~40% decode), vectorized decode GELU, faster output heads done; clean results run next |
 | M7. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
 ## Getting started
@@ -189,7 +189,8 @@ users can install Modular's Mojo extension.
 | Integer softmax (`intmath.masked_softmax`) | `uv run mojo run -I . tests/int_softmax.mojo` | `PASS` (SIMD == scalar, max error ≤ 1e-4; measured 4.3e-5) |
 | Integer attention matches exact math on the same quantized data | `uv run mojo run -I . tests/int_attention_check.mojo` | `PASS` (≤ 5e-3 of the output; measured 4.1e-4) |
 | A16 perplexity matches NumPy | `uv run --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --quant 4,32,0 --quant-head 8,0,0 --act16` vs `./gpt2t_bin --dtype int4-g32-a16 --ppl tests/data/alice_ch1.txt` | same to ~1e-4 relative (int16 rounding flips; see M4) |
-| GGUF perplexity matches NumPy | `uv run --with gguf --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --gguf FILE` vs `./gpt2t_bin --gguf FILE --ppl tests/data/alice_ch1.txt` | same to ~6 digits |
+| GGUF perplexity matches NumPy | `uv run --with gguf --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --gguf FILE` vs `./gpt2t_bin --gguf FILE --kv f32 --ppl tests/data/alice_ch1.txt` | same to ~5-6 digits (Q4_K_M: 25.460590 vs 25.460508) |
+| Integer GGUF heads (Q6_K, Q8_0): one-token and several-token paths identical, match exact math | `uv run mojo run -I . tests/gguf_int_head.mojo` | `PASS` (max relative error ≤ 1e-5; measured 1.8e-7) |
 
 Build both binaries before running these. Run `tests/same_as_baseline.sh`
 after any change to `gpt2t.mojo`, `kernels.mojo`, or `tensor.mojo`: float32
@@ -749,7 +750,7 @@ Next steps, in order:
    threads with a parallel region, then (if it's much cheaper) run each
    token's per-layer work inside one parallel region with barriers between
    operations, as llama.cpp does.
-3. A faster output head (16% of decode).
+3. A faster output head (16% of decode). (Done, see below.)
 4. A clean results run of every format on a quiet machine.
 
 **Done (2026-09-28):**
@@ -775,6 +776,39 @@ Next steps, in order:
   matches scalar tanh bit for bit, so output is identical for every format.
   Decode, 128 tokens, 3 runs: int4-g32-a16 --attention int 229-244 ->
   242-278 tok/s; f16 127-140 -> 138-144 (noisy machine).
+- Faster output heads (`research/test_head.mojo`). The head is 38.6M
+  weights per token and 16-35% of decode:
+  - int8 head (int formats): memory-bound; a plain read of its 38.6 MB
+    takes 0.77-0.86 ms. `QuantMatrix.dot_row_i16` for per-channel int8 is
+    now unrolled 4x and prefetches the row 8 rows ahead: 1.10 -> 1.00 ms
+    in the model (the probe's kernel alone: 1.07-1.13 -> 0.96-1.00 ms).
+    Same sums in the same order, so the output is identical.
+  - GGUF heads (Q6_K in Q4_0 and Q4_K_M, Q8_0 in Q8_0; the results table
+    said Q6_K for Q8_0's head, fixed) were limited by arithmetic (~16
+    GB/s): the float kernel converts every weight to float32. They now run
+    in integers (`GGUFMatrix.has_i16`, `dot_row_i16`, `unpack_row_i16`;
+    `kernels.head_i16` for T tokens and `head_team` for decode): the
+    activations as int16 (`quantize_rows`), the weights as int16 (Q8_0: q;
+    Q6_K: (q - 32) * scale, at most 4096 in magnitude so the int32 lanes
+    can't overflow), VPDPWSSD, then each group's float d. Decode and
+    evaluation use the same per-row arithmetic, so they see identical
+    logits (`tests/gguf_int_head.mojo`). Head per decoded token: Q4_K_M
+    2.8 -> 1.3 ms, Q4_0 2.4 -> 1.4, Q8_0 2.6 -> 1.8; decode Q4_K_M 7.9 ->
+    5.7 ms per token in the same session. Still arithmetic-bound
+    (~8 vector instructions per 32 weights at the ~1.5 GHz this chip runs
+    AVX-512 on all cores); int8 activations with VPDPBUSD would be next
+    (M7).
+  - Accuracy (Alice, int8 KV cache): Q4_K_M perplexity 25.4768 -> 25.4750,
+    Q8_0 25.4294 -> 25.4309, Q4_0 27.1985 -> 27.1970; top-1 agreement
+    within 0.12 points. `tests/reference.py --gguf` now quantizes the
+    head's input to int16 the same way: with `--kv f32` it matches gpt2t to
+    ~3e-6 (25.460508 vs 25.460590).
+  - Found along the way: `GGUFFile` frees its buffer when destroyed, and
+    Mojo destroys a value right after its last use, so a matrix from
+    `g.matrix(...)` points into freed memory once `g` is no longer used.
+    The model takes the buffer (`g^.release()`); the probes and tests now
+    keep `g` alive with `_ = g^` after their last use of the matrix
+    (test_dequant's and gguf_check's results were unaffected).
 
 ### M7. Stretch
 
@@ -812,6 +846,13 @@ The probes in `research/` (run: `uv run mojo run research/<file>.mojo`):
   GELU (`kernels.finish`) uses scalar tanh (3.0 ns), ~0.11 ms per token;
   vectorizing the MLP up-projection's epilogue recovers most of it (done:
   `kernels.emit_rows`).
+- **`test_head.mojo`**: the int8 output head is memory-bound, within ~15%
+  of a plain read, once its loop is unrolled and prefetches ahead. GGUF
+  Q6_K heads in integers (VPDPWSSD) are ~1.7x faster than in float but
+  still arithmetic-bound (~2x the read time). Building Q6_K's per-32
+  scale vector with a shuffle instead of broadcasts gains ~12%; forcing a
+  true VPERMW (the compiler rewrites a constant-mask shuffle into scalar
+  loads) gains nothing more.
 
 Hardware of the development machine (i7-1160G7): 4 cores / 8 threads, one
 512-bit FMA unit per core, 5 MB L2, 12 MB L3, 16 GB RAM, measured ~44–55 GB/s
@@ -922,7 +963,7 @@ Notes on f16 / bf16:
 | int4, per-channel sym + int8 head (ours) | | | | 51.819 (+105%) | | |
 | int4, group 32, head int4 too (`--head same`) | | | | 352.6 | | |
 | int4, group 32 sym, head int4 too | | | | 748.7 | | |
-| GGUF Q8_0 (head Q6_K) | 167 MB | 574 | 63 / 56 | 25.416 (+0.52%) | 91.1% | 1.2e-2 |
+| GGUF Q8_0 (head Q8_0) | 167 MB | 574 | 63 / 56 | 25.416 (+0.52%) | 91.1% | 1.2e-2 |
 | GGUF Q4_0 (head Q6_K) | 99 MB | 710 | 80 / 79 | 27.178 (+7.49%) | 74.6% | 1.7e-1 |
 | GGUF Q4_K_M (Q4_K/Q5_K/Q6_K, head Q6_K) | 105 MB | 690 | 107 / 90 | 25.460 (+0.70%) | 80.2% | 9.8e-2 |
 | GGUF i1-Q4_K_M (NumPy only so far) | 105 MB | | | 27.615 (+9.2%) | | |

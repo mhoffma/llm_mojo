@@ -99,3 +99,6 @@ def main() raises:
             "  ", type_name(m.kind), c[1], "[", m.rows, "x", m.cols, "]:",
             r[0], "|", r[1], "|", r[2],
         )
+        # m points into g's buffer: keep g alive until here (Mojo destroys a
+        # value right after its last use, here g.matrix).
+        _ = g^

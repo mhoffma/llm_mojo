@@ -675,6 +675,10 @@ def linear[
 
 def head[W: WeightMatrix, //](logits: FPtr, h: FPtr, w: W, T: Int, V: Int, C: Int):
     """logits[T, V] = h[T, C] @ w[V, C]^T: the output head, for T rows."""
+    comptime if W.FROM_GGUF:
+        if w.has_i16():
+            head_i16(logits, h, w, T, V, C)
+            return
     comptime if W.ACT16:
         matmul_rows_a16[BIAS=False](logits, h, w, h, T, C, V)
     elif W.OUT_MAJOR:
@@ -684,6 +688,52 @@ def head[W: WeightMatrix, //](logits: FPtr, h: FPtr, w: W, T: Int, V: Int, C: In
             lm_head(logits, h, w, V, C)
         else:
             lm_head_rows(logits, h, w, T, V, C)
+
+
+def head_i16[W: WeightMatrix, //](logits: FPtr, h: FPtr, w: W, T: Int, V: Int, C: Int):
+    """The output head in integers for a GGUF matrix with an integer kernel
+    (Q6_K): h quantized to int16 per row, then per vocabulary row either
+    dot_row_i16 (one token) or the row unpacked once and dotted with 4 tokens
+    at a time (dot4_i16). Both give the same result for a row, so decode
+    and evaluation see the same logits; head_team does the same for decode.
+
+    Q6_K's float kernel converts every weight to float32 and is limited by
+    arithmetic (~15 GB/s); with VPDPWSSD the head runs near memory speed.
+    """
+    var xq = unsafe_alloc[Int16](T * C)
+    var sx = unsafe_alloc[Float32](T)
+    quantize_rows(h, T, C, xq, sx)
+    var G = w.group_size()
+    comptime CHUNK = 64
+    var nchunks = (V + CHUNK - 1) // CHUNK
+
+    def chunk(ci: Int) {imm}:
+        var row = unsafe_alloc[Int16](C)
+        var rs = unsafe_alloc[Float32](C // G)
+        for v in range(ci * CHUNK, min(V, (ci + 1) * CHUNK)):
+            if T == 1:
+                logits[unsafe_offset=v] = w.dot_row_i16(v, xq, rs) * sx[unsafe_offset=0]
+                continue
+            w.unpack_row_i16(v, row, rs)
+            var t = 0
+            while t + 4 <= T:
+                var d = dot4_i16(row, rs, xq.unsafe_offset(t * C), C, G)
+                comptime for r in range(4):
+                    logits[unsafe_offset = (t + r) * V + v] = d[r] * sx[
+                        unsafe_offset = t + r
+                    ]
+                t += 4
+            while t < T:
+                logits[unsafe_offset = t * V + v] = dot1_i16(
+                    row, rs, xq.unsafe_offset(t * C), C, G
+                ) * sx[unsafe_offset=t]
+                t += 1
+        row.unsafe_free()
+        rs.unsafe_free()
+
+    parallelize(chunk, nchunks)
+    xq.unsafe_free()
+    sx.unsafe_free()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -833,6 +883,17 @@ def head_team[
 ):
     """One token: logits[V] = h[C] @ w[V, C]^T, by thread tid of the team;
     ends with a barrier. Same arithmetic as `head` for T = 1."""
+    comptime if W.FROM_GGUF:
+        if w.has_i16():  # Q6_K: see head_i16
+            if tid == 0:
+                quantize_rows(h, 1, C, xq, sx)
+            team.wait()
+            var s = sx[unsafe_offset=0]
+            var r = split(V, tid, team.nt)
+            for v in range(r[0], r[1]):
+                logits[unsafe_offset=v] = w.dot_row_i16(v, xq, xs) * s
+            team.wait()
+            return
     comptime if W.OUT_MAJOR:
         linear_team[BIAS=False](tid, team, logits, h, w, h, C, V, h, xq, xp, xs, sx)
     else:

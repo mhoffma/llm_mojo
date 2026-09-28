@@ -46,6 +46,7 @@ dtype int4-g32-a16+head-int8-ch-a16 | 88 MB | load 2391 ms | prompt 12 tokens in
 - **Integer inference (W4A16 / W8A16).** Activations are quantized to int16 at run time, and matmuls run as int16 × int16 → int32 with the AVX-512 VNNI `VPDPWSSD` instruction:
   - Decode (one token at a time) uses a custom group-per-lane code layout.
   - Prompts use a VNNI register-tiled kernel.
+  - GGUF output heads (Q6_K, Q8_0) also run in integers: ~1.7x faster than dequantizing to float.
   - int4 group 32 with int16 activations and integer attention is our fastest decoder (~235 tok/s after a short prompt), at +1.2% perplexity and 88 MB.
 - **Fast kernels for every format:**
   - SIMD dequantization with the dot product fused in, for decode
@@ -74,7 +75,7 @@ All measurements are on an Intel i7-1160G7 laptop (Tiger Lake, 4 cores / 8 threa
 | f32 | 474 MB | 25.284 | 100% | 0 | ~560 | ~60 |
 | f16 | 239 MB | 25.302 (+0.07%) | 99.7% | 0.00002 | ~550 | ~90 |
 | bf16 | 239 MB | 25.073 (−0.84%)¹ | 95.1% | 0.0074 | ~610 | ~80 |
-| GGUF Q8_0 (6-bit head) | 167 MB | 25.416 (+0.52%) | 91.1% | 0.012 | ~575 | ~63 |
+| GGUF Q8_0 (8-bit head) | 167 MB | 25.416 (+0.52%) | 91.1% | 0.012 | ~575 | ~63 |
 | GGUF Q4_K_M (4/5/6-bit mix) | 105 MB | 25.460 (+0.70%) | 80.2% | 0.098 | ~690 | ~107 |
 | GGUF Q4_0 (6-bit head) | 99 MB | 27.178 (+7.5%) | 74.6% | 0.170 | ~710 | ~80 |
 | int8 per-channel (ours) | 121 MB | 26.116 (+3.3%) | 81.6% | 0.046 | ~660 | ~124 |
@@ -449,8 +450,9 @@ Build `gpt2t_bin` (and `gpt2_bin` for the first check) before running these:
 | Logits, greedy decoding and perplexity match a NumPy GPT-2 | `uv run --with tiktoken python tests/reference.py {logits,greedy,ppl} ...` |
 | Our quantization matches NumPy (add `--quant BITS,GROUP,SYM`, `--quant-head`, `--act16`, `--kv FMT`) | `uv run --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --quant 4,32,0 --quant-head 8,0,0` |
 | GGUF dequantization matches llama.cpp's Python `gguf` package | `uv run --with gguf python tests/gguf_check.py gpt2/gguf/gpt2.Q4_K_M.gguf` |
-| GGUF perplexity matches NumPy | `uv run --with gguf --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --gguf FILE` |
+| GGUF perplexity matches NumPy (compare with `--kv f32`) | `uv run --with gguf --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --gguf FILE` |
 | Integer kernels match exact float64 math, including worst-case overflow inputs | `uv run mojo run -I . tests/a16_kernels.mojo` |
+| Integer GGUF heads: decode and prompt paths identical, match exact math | `uv run mojo run -I . tests/gguf_int_head.mojo` |
 | Integer softmax and integer attention match exact math | `uv run mojo run -I . tests/int_softmax.mojo`, `tests/int_attention_check.mojo` |
 | Tokenizer matches `tiktoken` | `uv run --with tiktoken python tests/tokenizer_vs_tiktoken.py` |
 
@@ -467,7 +469,8 @@ Current results:
 - **Set `MODULAR_THREAD_BUSY_WAIT_US=0`.** By default, idle Mojo worker threads spin between parallel regions. On a 15 W 4-core laptop the spinning threads take cycles and power from the working ones. This setting took float32 decode from ~38 to ~60 tok/s when decoding still used ~60 parallel regions per token. Decoding now uses one region per token, but prompts still use one per operation. The runtime reads it at startup, so it must be set in the environment. Machines with more cores may prefer a different value.
 - **Decode threads:** `--threads N` sets the decode team size. The default, one per physical core, was ~40% faster than using every hyperthread on this CPU.
 - **Benchmark on AC power and interleave runs.** On battery, long-context decode drops to about half. `tests/bench.sh` runs formats in alternating rounds, prints medians, and warns when on battery.
-- **Decode is still below the memory limit** for the quantized formats: ~90 MB per token at ~235 tok/s is ~21 GB/s, against the ~44–55 GB/s the machine can stream. The next target is the output head, 38.6M weights per token.
+- **Decode is still below the memory limit** for the quantized formats: ~90 MB per token at ~260 tok/s is ~23 GB/s, against the ~44–55 GB/s the machine can stream.
+- **The output head** (38.6M weights per token, 16-35% of decode) is the largest single operation. At int8 it runs within ~15% of the time a plain read of its bytes takes. GGUF heads (Q6_K, Q8_0) now run in integers: 2.1-2.8 ms down to 1.3-1.8 ms per token. They are still limited by arithmetic. (`research/test_head.mojo`)
 
 ## Project layout
 
@@ -501,7 +504,7 @@ Mojo 1.1 differs a lot from older Mojo, which most online examples use. `PLAN.md
 | M3. float16 / bfloat16, own int8 / int4 with int8 head, GGUF, fast kernels | done |
 | M4. int16 activations with integer VNNI kernels (W4A16 / W8A16) | done |
 | M5. Pluggable KV cache formats matched to the model's precision, and integer attention | done |
-| M6. Tuning: profiling, one parallel region per decoded token (done, ~40% faster decode); faster output head and a clean results re-run (next) | in progress |
+| M6. Tuning: profiling, one parallel region per decoded token (done, ~40% faster decode), vectorized GELU, faster output heads (done); a clean results re-run (next) | in progress |
 | M7. Stretch: save pre-quantized weights, int8 activations (VPDPBUSD) | planned |
 
 Open questions (details in `PLAN.md`):

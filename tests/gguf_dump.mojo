@@ -30,3 +30,6 @@ def main() raises:
                 sq += v * v
             print(name, type_name(m.kind), row, s, sq, buf[unsafe_offset=0], buf[unsafe_offset=m.cols - 1])
         buf.unsafe_free()
+    # The matrices point into g's buffer: keep g alive until here (Mojo
+    # destroys a value right after its last use, here the last g.matrix).
+    _ = g^

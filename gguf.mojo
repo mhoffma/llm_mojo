@@ -32,8 +32,9 @@ from std.memory import bitcast
 from std.memory.alloc import unsafe_alloc
 from std.collections import Dict
 from std.os import abort, SEEK_END, SEEK_SET
+from std.utils import IndexList
 
-from tensor import FPtr, NW, F32V, WeightMatrix
+from tensor import FPtr, NW, F32V, WeightMatrix, I16Ptr, I16x32, I32x16, dot_pairs
 
 comptime BPtr = Pointer[UInt8, MutUntrackedOrigin]
 
@@ -296,6 +297,45 @@ def dequant_q6_k[DOT: Bool](b: BPtr, dst: FPtr, x: FPtr, acc_in: F32x16) -> F32x
     return acc
 
 
+@always_inline
+def q8_0_i16(b: BPtr) -> I16x32:
+    """The 32 int8 weights of the Q8_0 block at b, as int16."""
+    return bitcast[DType.int8, 32](b.unsafe_load[width=32](2)).cast[DType.int16]()
+
+
+@always_inline
+def q6_k_scales(b: BPtr) -> I16x32:
+    """The 16 int8 scales of the Q6_K superblock at b as int16, in lanes
+    0-15 (and repeated in 16-31), for q6_k_i16's VPERMW."""
+    var s = b.unsafe_load[width=16](192).cast[DType.int8]().cast[DType.int16]()
+    return s.join(s)
+
+
+def scale_mask(g: Int) -> IndexList[32]:
+    """Shuffle mask: lanes 0-15 take scale g, lanes 16-31 scale g + 1."""
+    var m = IndexList[32]()
+    for i in range(32):
+        m[i] = g if i < 16 else g + 1
+    return m
+
+
+@always_inline
+def q6_k_i16[n: Int, k: Int](b: BPtr, sv: I16x32) -> I16x32:
+    """Weights 128n + 32k .. +31 of the Q6_K superblock at b as int16
+    (q - 32) * scale. The same bytes as dequant_q6_k, read 32 at a time:
+    the 32 weights are half n's h = 0 and h = 1 vectors for this k, whose
+    16-weight groups have scales 8n + 2k and 8n + 2k + 1.
+
+    The scale vector is a shuffle of sv (q6_k_scales): ~12% faster than
+    building it from two scalar loads (research/test_head.mojo)."""
+    var L = b.unsafe_load[width=32](64 * n + (32 if k % 2 == 1 else 0))
+    var H = b.unsafe_load[width=32](128 + 32 * n)
+    comptime SHIFT = SIMD[DType.uint8, 32](2 * k)  # this k's pair of high bits
+    var q = (((L >> 4) if k >= 2 else (L & 0xF)) | (((H >> SHIFT) & 3) << 4))
+    comptime MASK = scale_mask(8 * n + 2 * k)
+    return (q.cast[DType.int16]() - 32) * sv.shuffle[MASK]()
+
+
 # ===----------------------------------------------------------------------=== #
 # A GGUF tensor as a weight matrix
 # ===----------------------------------------------------------------------=== #
@@ -401,6 +441,68 @@ struct GGUFMatrix(WeightMatrix):
         var v = buf.unsafe_load[width=width](col)
         buf.unsafe_free()
         return v
+
+    # Integer path, for the formats of the output heads of GPT-2's GGUF
+    # files (Q6_K in Q4_0 and Q4_K_M, Q8_0 in Q8_0): activations as int16
+    # (kernels.quantize_rows), weights as int16, products summed in int32
+    # with VPDPWSSD, then each group's sum times its float scale d:
+    # - Q8_0: groups of 32, weights q. Each int32 lane sums 2 products.
+    # - Q6_K: groups of 256 (a superblock), weights (q - 32) * scale with the
+    #   16-weight group's int8 scale. |(q - 32) * scale| <= 32 * 128 = 4096,
+    #   so each int32 lane (16 products) stays within
+    #   16 * 4096 * 32767 = 2,147,418,112 < 2^31.
+    # research/test_head.mojo measured the speed and error.
+
+    def has_i16(self) -> Bool:
+        return self.kind == GGML_Q6_K or self.kind == GGML_Q8_0
+
+    def group_size(self) -> Int:
+        return 256 if self.kind == GGML_Q6_K else 32
+
+    def dot_row_i16(self, row: Int, xq: I16Ptr, xsums: FPtr) -> Float32:
+        """Unpacks and multiplies in one pass, in the same order as
+        kernels.dot1_i16 on unpack_row_i16's output (identical results)."""
+        var p = self.data.unsafe_offset(row * self.row_bytes)
+        var accf = F32x16(0)
+        if self.kind == GGML_Q8_0:
+            for blk in range(self.cols // 32):
+                var b = p.unsafe_offset(blk * 34)
+                var acc = dot_pairs(
+                    I32x16(0), xq.unsafe_load[width=32](blk * 32), q8_0_i16(b)
+                )
+                accf = acc.cast[DType.float32]().fma(F32x16(f16_at(b, 0)), accf)
+            return accf.reduce_add()
+        for sb in range(self.cols // 256):
+            var b = p.unsafe_offset(sb * 210)
+            var sv = q6_k_scales(b)
+            var acc = I32x16(0)
+            comptime for n in range(2):
+                comptime for k in range(4):
+                    acc = dot_pairs(
+                        acc,
+                        xq.unsafe_load[width=32](sb * 256 + 128 * n + 32 * k),
+                        q6_k_i16[n, k](b, sv),
+                    )
+            accf = acc.cast[DType.float32]().fma(F32x16(f16_at(b, 208)), accf)
+        return accf.reduce_add()
+
+    def unpack_row_i16(self, row: Int, dst: I16Ptr, scales: FPtr):
+        var p = self.data.unsafe_offset(row * self.row_bytes)
+        if self.kind == GGML_Q8_0:
+            for blk in range(self.cols // 32):
+                var b = p.unsafe_offset(blk * 34)
+                dst.unsafe_store(blk * 32, q8_0_i16(b))
+                scales[unsafe_offset=blk] = f16_at(b, 0)
+            return
+        for sb in range(self.cols // 256):
+            var b = p.unsafe_offset(sb * 210)
+            var sv = q6_k_scales(b)
+            comptime for n in range(2):
+                comptime for k in range(4):
+                    dst.unsafe_store(
+                        sb * 256 + 128 * n + 32 * k, q6_k_i16[n, k](b, sv)
+                    )
+            scales[unsafe_offset=sb] = f16_at(b, 208)
 
     def nbytes(self) -> Int:
         return self.rows * self.row_bytes

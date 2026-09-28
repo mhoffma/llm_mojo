@@ -28,7 +28,9 @@ or symmetric integers with one scale per position and head.
 Add --gguf FILE to any mode to take the weights from a llama.cpp GGUF file
 instead (dequantized to float32 with the `gguf` package, so add
 `--with gguf` to uv run). GGUF stores GPT-2's output head as a separate
-tensor (output.weight), which is used in place of the tied wte.
+tensor (output.weight), which is used in place of the tied wte. Its input is
+quantized to int16 when it is Q6_K or Q8_0, as gpt2t computes those heads
+in integers.
 Add --quant-only NAME (e.g. mlp.c_proj, or wte) to quantize only the matrices
 whose name ends with NAME, to find which ones lose the most accuracy.
 
@@ -76,10 +78,10 @@ def kvq(x):
     return (np.round(x * (1 / s)) * s).astype(np.float32)
 
 
-def aq(x):
+def aq(x, force=False):
     """Fake-quantizes matmul inputs to int16, one scale per row, like
-    kernels.quantize_rows."""
-    if not ACT16:
+    kernels.quantize_rows (with --act16, or when force is set)."""
+    if not (ACT16 or force):
         return x
     s = np.abs(x).max(axis=-1, keepdims=True).astype(np.float32) / 32767
     s = np.where(s == 0, 1, s)
@@ -102,6 +104,17 @@ def gguf_name(name):
              "ln_2": "ffn_norm", "mlp.c_fc": "ffn_up", "mlp.c_proj": "ffn_down"}
     module, kind = rest.rsplit(".", 1)
     return f"blk.{layer}.{parts[module]}.{kind}"
+
+
+def gguf_head_int():
+    """Whether gpt2t runs this GGUF file's output head in integers."""
+    if GGUF is None:
+        return False
+    from gguf import GGMLQuantizationType as Q
+
+    names = ("output.weight", "token_embd.weight")  # tied if no output.weight
+    head = next(x for n in names for x in GGUF.tensors if x.name == n)
+    return head.tensor_type in (Q.Q6_K, Q.Q8_0)
 
 
 def t_gguf(name):
@@ -193,7 +206,9 @@ def forward(toks, all_positions=False):
         x = x + aq(m) @ t(p + "mlp.c_proj.weight") + t(p + "mlp.c_proj.bias")
     x = ln(x, t("ln_f.weight"), t("ln_f.bias"))
     head = t("lm_head") if GGUF is not None else t("wte.weight")
-    return aq(x if all_positions else x[-1]) @ head.T
+    # gpt2t computes GGUF heads stored as Q6_K or Q8_0 (all of GPT-2's GGUF
+    # files) in integers, with int16 activations (gguf.mojo).
+    return aq(x if all_positions else x[-1], force=gguf_head_int()) @ head.T
 
 
 def perplexity(ids, window=1024, stride=512):

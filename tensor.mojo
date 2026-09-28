@@ -15,7 +15,7 @@ exactly the plain SIMD load the untyped gpt2.mojo does.
 from std.memory import bitcast
 from std.memory.alloc import unsafe_alloc
 from std.sys.info import CompilationTarget
-from std.sys.intrinsics import llvm_intrinsic
+from std.sys.intrinsics import llvm_intrinsic, prefetch
 from std.sys import simd_width_of, size_of
 from std.os import abort
 from std.math import round
@@ -96,6 +96,12 @@ trait WeightMatrix(Deinitable, ImplicitlyCopyable):
     def dot_row(self, row: Int, x: FPtr) -> Float32:
         """Returns the dot product of row `row` with x[cols]."""
         ...
+
+    def has_i16(self) -> Bool:
+        """Whether this matrix has the integer methods below (dot_row_i16,
+        unpack_row_i16, group_size): always for ACT16 formats; for formats
+        that mix block types at runtime (GGUF), per matrix."""
+        return Self.ACT16
 
     def permute_x_i16(self, xq: I16Ptr, n: Int, dst: I16Ptr, sums: FPtr) -> Bool:
         """For ACT16 formats whose decode layout needs it: writes the int16
@@ -509,6 +515,32 @@ struct QuantMatrix[
                 var xs = xsums.unsafe_load[width=16](blk * 16)
                 accf = (acc.cast[DType.float32]() - zp * xs).fma(sc, accf)
             return accf.reduce_add()
+        comptime if Self.GROUP == 0 and Self.BITS == 8:
+            # Per-channel int8 (the output head, int8-ch layers): one group
+            # per row. The loop over the row is unrolled 4x, and the row 8
+            # ahead is prefetched (a prefetch never faults, even past the
+            # end); together ~15% faster on the memory-bound output head
+            # (research/test_head.mojo). Same sums in the same order as the
+            # general loop below, so the result is identical.
+            var ahead = p.unsafe_offset(8 * self.cols)
+            for l in range(0, self.cols, 64):
+                prefetch(ahead.unsafe_offset(l))
+            var zp = I16x32(Int16(Int(self.zero_point[unsafe_offset=row])))
+            var acc = I32x16(0)
+            var k = 0
+            while k + 128 <= self.cols:
+                comptime for u in range(4):
+                    acc = dot_pairs(
+                        acc,
+                        xq.unsafe_load[width=32](k + 32 * u),
+                        self.codes_i16(p, k + 32 * u, zp),
+                    )
+                k += 128
+            while k < self.cols:
+                acc = dot_pairs(acc, xq.unsafe_load[width=32](k), self.codes_i16(p, k, zp))
+                k += 32
+            var s = self.scale[unsafe_offset=row].cast[DType.float32]()
+            return acc.cast[DType.float32]().fma(F32x16(s), F32x16(0)).reduce_add()
         for g in range(gpr):
             var zp = I16x32(Int16(Int(self.zero_point[unsafe_offset = row * gpr + g])))
             var acc = I32x16(0)
