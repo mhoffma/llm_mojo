@@ -51,8 +51,9 @@ accuracy each format costs for that speed**.
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
-| M5. Tuning and final results table | ☐ |
-| M6. Stretch: pre-quantized weight files, int8 activations | ☐ |
+| M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) | 🔄 step 1 done (trait + float32, bit-identical); step 2 (f16/bf16/int16/int8 + `--kv`) next |
+| M6. Tuning and final results table | ☐ |
+| M7. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
 ## Getting started
 
@@ -157,6 +158,7 @@ users can install Modular's Mojo extension.
 | `tensor.mojo` | The `WeightMatrix` trait and our formats: `DenseMatrix[dtype]`, `QuantMatrix[bits, group, symmetric, a16]` |
 | `gguf.mojo` | GGUF file reader and `GGUFMatrix`: dequantizes Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 |
 | `kernels.mojo` | matmul (prefill), GEMV (decode), `matmul_rows` for `[OUT, IN]` weights, LayerNorm, attention, output head; generic over `W: WeightMatrix` |
+| `kvcache.mojo` | The `KVCache` trait and its formats (`DenseKV[dtype]` so far) |
 | `tokenizer.mojo` | GPT-2 byte-level BPE tokenizer (reads `vocab.json`, `merges.txt`) |
 | `tests/` | Correctness checks and the accuracy harness's reference (see below); `tests/data/` holds the evaluation text |
 | `research/` | Small commented probe programs, each answering one question; see `research/README.md` |
@@ -445,17 +447,101 @@ sums in int32. With symmetric formats `zero_point` is the constant 8 (int4).
 - Compare W4A16 against the M3 W4A32 result to measure the error the
   activations add (expected: almost none).
 
-### M5. Tuning and results
+### M5. Pluggable KV cache formats
+
+**Why.** The KV cache holds each past token's key and value for every
+layer: `[12 layers, position, 12 heads, 64]`, 72 KB per token in float32,
+75.5 MB for a full 1,024-token context. It was float32 by default (and kept
+so on purpose while measuring weight formats, to change one thing at a
+time). But the weights shrank and the cache didn't: for int4-g32-a16 (~87 MB
+of weights read per token), a decode step at position 476 also reads 35 MB
+of cache (40% extra), and at 1,024 it reads 75 MB (87% extra). That's why
+"decode long" (~105 tok/s) trails "decode short" (~145).
+
+**Design.** The cache becomes a third format parameter, like the weights:
+
+```mojo
+trait KVCache(Movable):
+    @staticmethod
+    def name() -> String                    # "f32", "f16", "bf16", "int16", "int8"
+    def __init__(out self, n_layer: Int, max_t: Int, n_head: Int, head_dim: Int)
+    def store(self, layer: Int, pos: Int, k: FPtr, v: FPtr)     # one token's K, V rows
+    def score(self, layer: Int, pos: Int, head: Int, q: FPtr) -> Float32   # q · k
+    def add_value(self, layer: Int, pos: Int, head: Int, p: Float32, mut acc: ...)  # acc += p * v
+    def nbytes(self) -> Int
+
+struct Model[W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.float32]]
+```
+
+- `DenseKV[dtype]`: float32 (today's cache), float16, bfloat16.
+- `QuantKV[BITS]` (16 or 8): symmetric, one float scale per (layer,
+  position, head), computed in `store` when the token is added.
+- `attention[KV]` calls `score` / `add_value`, inlined per format.
+- Defaults follow the model's precision; `--kv FMT` overrides (e.g.
+  `--dtype f32 --kv int8` measures the cache's error alone):
+
+  | `--dtype` | default KV |
+  |---|---|
+  | `f32` | `f32` |
+  | `f16` / `bf16` | `f16` / `bf16` |
+  | int formats (float compute or `-a16`), `--gguf` | `int16` |
+
+- For `-a16` models with an int16 cache, attention can use VPDPWSSD too:
+  the query quantized to int16 once per step, `q · k` over 64 dimensions in
+  2 VPDPWSSDs scaled by `scale_q × scale_k[pos]`, and the value scale folded
+  into the softmax weight.
+
+| Cache | Per token | Full context | Read at position 476 |
+|---|---|---|---|
+| float32 | 72 KB | 75.5 MB | 35 MB |
+| float16 / int16 | ~37 KB | ~38 MB | ~18 MB |
+| int8 | ~19 KB | ~20 MB | ~9 MB |
+
+**Steps.**
+
+1. ✅ `KVCache` trait + `DenseKV[float32]`, attention made generic over it.
+   Acceptance: `tests/same_as_baseline.sh` all `SAME` (bit-identical), and
+   no speed loss.
+   - Done (2026-09-28): `kvcache.mojo` holds the trait (`name`, `create`,
+     `store`, `score[HS]`, `add_value[HS]`, `nbytes`, `free`) and
+     `DenseKV[dtype]`. Like WeightMatrix, a cache is a handle the model frees
+     once. `Model[W, E, KV = DenseKV[float32]]` owns `kv`; `blocks` stores
+     each new token's K and V with `kv.store`, and `kernels.attention[KV]`
+     reads through `score` / `add_value`, which keep the original arithmetic
+     (score: multiply then add, scaled afterwards; values: FMA).
+   - All five `tests/same_as_baseline.sh` cases `SAME`; int4-g32-a16
+     perplexity identical to the last digit (25.592746803469293).
+   - Speed: interleaved long-context runs of the previous and new binaries
+     were indistinguishable within noise (the machine was busy for part of
+     it: f32 decode long 47 vs 51 median in one set, both ~20-25 under
+     load in the next). Same loads and arithmetic as before; only the
+     address computation moved into the inlined trait method.
+2. `DenseKV[f16/bf16]` and `QuantKV[16/8]` with float arithmetic; `--kv`
+   flag and defaults; a `--kv` fake-quantization option in
+   `tests/reference.py` to verify them against NumPy.
+3. Accuracy: `--ppl --compare` for each cache format, with float32 weights
+   (the cache's error alone) and with the quantized weight formats. The
+   Alice windows reach 1,024 tokens, so the whole cache is exercised.
+4. Integer attention for `-a16` models with an int16 cache (VPDPWSSD), with
+   a unit test against exact math like `tests/a16_kernels.mojo`.
+5. Benchmark "decode long" with `tests/bench.sh`; update Results and the
+   README.
+
+Expectation: int16 essentially lossless, like int16 activations; int8 close,
+unless GPT-2's outlier channels make per-head key scales too coarse.
+
+### M6. Tuning and results
 
 Kernel tuning for the quantized paths (tile sizes, prefetching, thread
-split), then fill in the [Results](#results) table.
+split), a faster output head (38.6M weights per token, the biggest single
+decode cost), fewer thread wake-ups per token (~60 parallel regions), then a
+clean re-run of the [Results](#results) table.
 
-### M6. Stretch
+### M7. Stretch
 
 - Save pre-quantized weights to a file so loading skips quantization.
 - int8 activations with VPDPBUSD (u8 × s8), which needs care with GPT-2's
   outlier activation channels.
-- Quantized KV cache for long contexts.
 
 ## Research findings
 

@@ -45,6 +45,7 @@ from std.os import SEEK_END, SEEK_SET
 from tensor import FPtr, NW, F32V, WeightMatrix, DenseMatrix, QuantMatrix
 from max.algorithm import parallelize
 from kernels import linear, head, layernorm, attention, MAX_PARTS
+from kvcache import KVCache, DenseKV
 from gguf import GGUFFile, GGUFMatrix, BPtr, GGML_F32, type_name
 from tokenizer import Tokenizer, parse_uint, read_file_bytes
 
@@ -141,7 +142,11 @@ def read_safetensors(path: String, mut header: String) raises -> FPtr:
     return params
 
 
-struct Model[W: WeightMatrix, E: WeightMatrix = W](Movable):
+struct Model[
+    W: WeightMatrix,
+    E: WeightMatrix = W,
+    KV: KVCache = DenseKV[DType.float32],
+](Movable):
     """GPT-2 with its layer matrices stored in format W, and its token
     embedding / output head (wte, lm) in format E, W by default.
 
@@ -170,8 +175,7 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W](Movable):
     var att: FPtr
     var fc: FPtr
     var logits: FPtr
-    var kcache: FPtr  # [N_LAYER, MAX_T, C]
-    var vcache: FPtr
+    var kv: Self.KV  # keys and values of past tokens, all layers
     var scratch: FPtr  # gemv partial sums
 
     def __init__(
@@ -210,8 +214,7 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W](Movable):
         self.att = unsafe_alloc[Float32](MAX_T * C)
         self.fc = unsafe_alloc[Float32](MAX_T * 4 * C)
         self.logits = unsafe_alloc[Float32](V)
-        self.kcache = unsafe_alloc[Float32](N_LAYER * MAX_T * C)
-        self.vcache = unsafe_alloc[Float32](N_LAYER * MAX_T * C)
+        self.kv = Self.KV.create(N_LAYER, MAX_T, N_HEAD, HS)
         self.scratch = unsafe_alloc[Float32](MAX_PARTS * 4 * C)
 
     def __deinit__(deinit self):
@@ -228,8 +231,7 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W](Movable):
         self.att.unsafe_free()
         self.fc.unsafe_free()
         self.logits.unsafe_free()
-        self.kcache.unsafe_free()
-        self.vcache.unsafe_free()
+        self.kv.free()
         self.scratch.unsafe_free()
 
     def weight_bytes(self) -> Int:
@@ -277,8 +279,6 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W](Movable):
         for l in range(N_LAYER):
             var m = self.mats.unsafe_ptr().unsafe_offset(l * N_MATS)
             var v = self.vecs.unsafe_ptr().unsafe_offset(l * N_VECS)
-            var kc = self.kcache.unsafe_offset(l * MAX_T * C)
-            var vc = self.vcache.unsafe_offset(l * MAX_T * C)
 
             layernorm[C](
                 xn, x, v[unsafe_offset=LN1_W], v[unsafe_offset=LN1_B], T
@@ -293,15 +293,14 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W](Movable):
                 3 * C,
                 self.scratch,
             )
+            # Each new token's key and value (columns C.. and 2C.. of its qkv
+            # row) go into the cache, then attention reads it.
             for t in range(T):
                 var row = qkv.unsafe_offset(t * 3 * C)
-                var dst = (pos0 + t) * C
-                for i in range(0, C, NW):
-                    kc.unsafe_store(dst + i, row.unsafe_load[width=NW](C + i))
-                    vc.unsafe_store(
-                        dst + i, row.unsafe_load[width=NW](2 * C + i)
-                    )
-            attention[N_HEAD, HS](self.att, qkv, kc, vc, T, pos0)
+                self.kv.store(
+                    l, pos0 + t, row.unsafe_offset(C), row.unsafe_offset(2 * C)
+                )
+            attention[N_HEAD, HS](self.att, qkv, self.kv, l, T, pos0)
             linear[RESID=True](
                 x,
                 self.att,

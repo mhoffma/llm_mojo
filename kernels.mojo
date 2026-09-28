@@ -16,6 +16,7 @@ from std.memory.alloc import unsafe_alloc
 from std.runtime import parallelism_level
 from max.algorithm import parallelize
 
+from kvcache import KVCache
 from tensor import (
     FPtr,
     NW,
@@ -196,12 +197,13 @@ def layernorm[C: Int](out_: FPtr, x: FPtr, w: FPtr, b: FPtr, T: Int):
 
 
 def attention[
-    N_HEAD: Int, HS: Int
-](out_: FPtr, qkv: FPtr, kc: FPtr, vc: FPtr, T: Int, pos0: Int):
+    KV: KVCache, //, N_HEAD: Int, HS: Int
+](out_: FPtr, qkv: FPtr, kv: KV, layer: Int, T: Int, pos0: Int):
     """Causal multi-head attention for T new tokens at positions pos0.. .
 
-    Queries come from qkv ([T, 3C]); keys and values come from the layer's KV
-    cache ([pos, C]), which already holds positions 0 .. pos0+T-1.
+    Queries come from qkv ([T, 3C]); keys and values come from the KV cache
+    (any KVCache format), which already holds this layer's positions
+    0 .. pos0+T-1.
     """
     comptime C = N_HEAD * HS
     var scale = 1 / sqrt(Float32(HS))
@@ -214,11 +216,7 @@ def attention[
         var scores = unsafe_alloc[Float32](npos)
         var mx = Float32.MIN
         for s in range(npos):
-            var k = kc.unsafe_offset(s * C + h * HS)
-            var d = F32V(0)
-            comptime for i in range(0, HS, NW):
-                d += q.unsafe_load[width=NW](i) * k.unsafe_load[width=NW](i)
-            var sc = d.reduce_add() * scale
+            var sc = kv.score[HS](layer, s, h, q) * scale
             scores[unsafe_offset=s] = sc
             mx = max(mx, sc)
         var total = Float32(0)
@@ -230,9 +228,7 @@ def attention[
         var acc = Array[F32V, length = HS // NW](fill=F32V(0))
         for s in range(npos):
             var p = F32V(scores[unsafe_offset=s] / total)
-            var v = vc.unsafe_offset(s * C + h * HS)
-            comptime for i in range(HS // NW):
-                acc[i] = p.fma(v.unsafe_load[width=NW](i * NW), acc[i])
+            kv.add_value[HS](layer, s, h, p, acc)
         comptime for i in range(HS // NW):
             o.unsafe_store(i * NW, acc[i])
         scores.unsafe_free()

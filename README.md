@@ -404,8 +404,9 @@ Mojo 1.1 differs a lot from older Mojo, which most online examples use. `PLAN.md
 | M2. Accuracy harness | done |
 | M3. float16 / bfloat16, own int8 / int4 with int8 head, GGUF, fast kernels | done |
 | M4. int16 activations with integer VNNI kernels (W4A16 / W8A16) | done |
-| M5. Tuning: faster output head, fewer thread wake-ups per token | next |
-| M6. Stretch: save pre-quantized weights, int8 activations (VPDPBUSD), quantized KV cache | planned |
+| M5. Pluggable KV cache formats: f32 / f16 / bf16 / int16 / int8, matched to the model's precision by default | in progress |
+| M6. Tuning: faster output head, fewer thread wake-ups per token | next |
+| M7. Stretch: save pre-quantized weights, int8 activations (VPDPBUSD) | planned |
 
 Open questions (details in `PLAN.md`):
 - A second evaluation text, to firm up the accuracy numbers.
