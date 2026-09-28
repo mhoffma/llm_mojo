@@ -19,6 +19,8 @@ and integer zero point per group along the reduction axis, GROUP 0 =
 per-channel, SYM 1 = symmetric. Use it to check `gpt2t_bin --dtype int...` independently.
 Add --quant-head BITS,GROUP,SYM to quantize wte (the tied embedding and
 output head) differently; gpt2t's default for int formats is 8,0,0.
+Add --act16 to also fake-quantize every matmul input to int16 (symmetric, one
+scale per token row), as gpt2t's -a16 formats do.
 
 Add --gguf FILE to any mode to take the weights from a llama.cpp GGUF file
 instead (dequantized to float32 with the `gguf` package, so add
@@ -46,6 +48,17 @@ BASE = 8 + n
 BUF = np.memmap(MODEL, dtype=np.uint8, mode="r")
 QUANT = None  # (bits, group, symmetric) when --quant is given
 QUANT_HEAD = None  # the same for wte (embedding and head), if --quant-head
+ACT16 = False  # --act16: quantize matmul inputs to int16 per row
+
+
+def aq(x):
+    """Fake-quantizes matmul inputs to int16, one scale per row, like
+    kernels.quantize_rows."""
+    if not ACT16:
+        return x
+    s = np.abs(x).max(axis=-1, keepdims=True).astype(np.float32) / 32767
+    s = np.where(s == 0, 1, s)
+    return (np.round(x * (1 / s)) * s).astype(np.float32)
 QUANTIZED = ("attn.c_attn.weight", "attn.c_proj.weight", "mlp.c_fc.weight",
              "mlp.c_proj.weight", "wte.weight")
 _cache = {}
@@ -140,7 +153,7 @@ def forward(toks, all_positions=False):
     x = t("wte.weight")[toks] + t("wpe.weight")[:T]
     for l in range(12):
         p = f"h.{l}."
-        a = ln(x, t(p + "ln_1.weight"), t(p + "ln_1.bias")) @ t(p + "attn.c_attn.weight")
+        a = aq(ln(x, t(p + "ln_1.weight"), t(p + "ln_1.bias"))) @ t(p + "attn.c_attn.weight")
         a = a + t(p + "attn.c_attn.bias")
         q, k, v = (z.reshape(T, 12, 64).transpose(1, 0, 2) for z in np.split(a, 3, axis=-1))
         s = q @ k.transpose(0, 2, 1) / 8.0
@@ -148,13 +161,13 @@ def forward(toks, all_positions=False):
         s = np.exp(s - s.max(-1, keepdims=True))
         s /= s.sum(-1, keepdims=True)
         o = (s @ v).transpose(1, 0, 2).reshape(T, 768)
-        x = x + o @ t(p + "attn.c_proj.weight") + t(p + "attn.c_proj.bias")
-        h = ln(x, t(p + "ln_2.weight"), t(p + "ln_2.bias")) @ t(p + "mlp.c_fc.weight")
+        x = x + aq(o) @ t(p + "attn.c_proj.weight") + t(p + "attn.c_proj.bias")
+        h = aq(ln(x, t(p + "ln_2.weight"), t(p + "ln_2.bias"))) @ t(p + "mlp.c_fc.weight")
         m = gelu(h + t(p + "mlp.c_fc.bias"))
-        x = x + m @ t(p + "mlp.c_proj.weight") + t(p + "mlp.c_proj.bias")
+        x = x + aq(m) @ t(p + "mlp.c_proj.weight") + t(p + "mlp.c_proj.bias")
     x = ln(x, t("ln_f.weight"), t("ln_f.bias"))
     head = t("lm_head") if GGUF is not None else t("wte.weight")
-    return (x if all_positions else x[-1]) @ head.T
+    return aq(x if all_positions else x[-1]) @ head.T
 
 
 def perplexity(ids, window=1024, stride=512):
@@ -176,7 +189,10 @@ def perplexity(ids, window=1024, stride=512):
 
 
 def main():
-    global QUANT, GGUF
+    global QUANT, GGUF, ACT16
+    if "--act16" in sys.argv:
+        ACT16 = True
+        sys.argv.remove("--act16")
     if "--gguf" in sys.argv:
         from gguf import GGUFReader
 

@@ -50,7 +50,7 @@ accuracy each format costs for that speed**.
 | M1. Generic weight formats, float32 bit-identical to baseline | ✅ done |
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
-| M4. int16 activations + integer VNNI kernel (W4A16) | ⏭ next |
+| M4. int16 activations + integer VNNI kernel (W4A16) | 🔄 working and verified; decode faster for large groups; integer prefill tiles next |
 | M5. Tuning and final results table | ☐ |
 | M6. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
@@ -367,6 +367,44 @@ Expectation to test: per-channel is fine for int8, but at int4 groups of
 
 ### M4. int16 activations + integer kernel (W4A16)
 
+**Status (2026-09-28): implemented and verified.**
+
+- `--dtype int4-g32-a16`, `int4-g64-a16`, `int4-g128-a16`, `int4-ch-a16`,
+  `int4-g32-sym-a16`, `int8-ch-a16`: `QuantMatrix[..., A16=True]` with the
+  output head as `QuantMatrix[8, 0, False, True]` (int8, integer path too).
+- `kernels.quantize_rows` quantizes each matmul input row to int16 (symmetric,
+  scale = max|x| / 32767). `kernels.matmul_rows_a16`: decode uses
+  `QuantMatrix.dot_row_i16` (unpack 32 codes to int16 minus the zero point,
+  one VPDPWSSD with 32 activations, per group int32 → float × scale); prefill
+  unpacks each weight row to int16 once and reuses it for 4 tokens at a time
+  (`dot4_i16`). `tensor.dot_pairs` wraps VPDPWSSD with a portable fallback.
+- Trait members `ACT16`, `dot_row_i16`, `unpack_row_i16`, `group_size` have
+  default bodies in the trait (abort), so only QuantMatrix implements them.
+- Accuracy: int16 activations cost essentially nothing: int4-g32 25.5921
+  (W4A32) → 25.5910 (W4A16). Verified against NumPy (`tests/reference.py
+  --act16`): 25.591020 vs 25.590796 (5 digits; the remaining difference is
+  rounding of exact .5 ties), and greedy decoding matches exactly.
+- Speed (decode, short context, battery, interleaved): the gain grows with
+  group size, because each group costs an int32 → float conversion and a
+  multiply by its scale, and with 32-weight groups that equals the one
+  VPDPWSSD per group:
+
+  | Layers | float compute | int16 activations | gain |
+  |---|---|---|---|
+  | int4, group 32 | 95 | 87 | none |
+  | int4, group 128 | 115 | 126 | +10% |
+  | int4, per-channel | 119 | 138 | +16% |
+  | int8, per-channel | 116 | 152 | +30% |
+
+  Prefill is slower in integers (427–493 vs 572–646 tok/s): `dot4_i16`
+  works one output row at a time, while the float path uses the 8×32
+  register-tiled `mm_tile`.
+- Next: an integer register-tiled prefill kernel (several output rows ×
+  several tokens), and cheaper per-group scaling for small groups (e.g.
+  accumulating int32 group sums for 16 groups before converting).
+
+Original plan:
+
 Note: `QuantMatrix` already uses an integer zero point, so per group
 `sum(x * w) = scale * (sum(x_q * u) - zero_point * sum(x_q))`, with both inner
 sums in int32. With symmetric formats `zero_point` is the constant 8 (int4).
@@ -480,7 +518,10 @@ Perplexity, top-1 agreement, and KL are on `tests/data/alice_ch1.txt` (see
 of `tests/bench.sh`, measured together with f32 (559 / 60 / 45) and f16
 (562 / 88 / 73) in the same session. *Our int formats: medians of 3 rounds
 on battery, measured with f16 (561 / 100 / 85), Q4_K_M (608 / 108 / 89) and
-Q4_0 (605 / 92 / 79) in the same session. Speed ranges are from two interleaved
+Q4_0 (605 / 92 / 79) in the same session. †W4A16/W8A16: 3 rounds on
+battery with f16 (624 / 94 / 78), int4-g32 (646 / 95 / 68), int8-ch
+(572 / 116 / 96), Q4_K_M (570 / 84 / 64). ‡2 rounds on battery with int4-g128
+(622 / 115 / 94) and int4-ch (607 / 119 / 97). Speed ranges are from two interleaved
 rounds; the machine's speed drifts by ±15% between runs (thermal), so compare
 formats measured in the same session.
 
@@ -519,7 +560,10 @@ Notes on f16 / bf16:
 | GGUF Q4_0 (head Q6_K) | 99 MB | 710 | 80 / 79 | 27.178 (+7.49%) | 74.6% | 1.7e-1 |
 | GGUF Q4_K_M (Q4_K/Q5_K/Q6_K, head Q6_K) | 105 MB | 690 | 107 / 90 | 25.460 (+0.70%) | 80.2% | 9.8e-2 |
 | GGUF i1-Q4_K_M (NumPy only so far) | 105 MB | | | 27.615 (+9.2%) | | |
-| W4A16 (best int4 config) | | | | | | |
+| int4, group 32, W4A16 + int8 head (A16) | 88 MB | 427† | 87 / 74† | 25.591 (+1.21%) | | |
+| int8, per-channel, W8A16 | 121 MB | 493† | **152 / 119**† | 26.116 (+3.29%) | | |
+| int4, group 128, W4A16 | 82 MB | 469‡ | 126 / 105‡ | | | |
+| int4, per-channel, W4A16 | 81 MB | 455‡ | 138 / 112‡ | | | |
 
 ## Open questions
 

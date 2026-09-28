@@ -10,12 +10,23 @@ trait. With `DenseMatrix[float32]` they compile to the same loads and the same
 order of floating-point operations, so they give bit-identical results.
 """
 
-from std.math import exp, tanh, sqrt
+from std.math import exp, tanh, sqrt, round
 from std.memory.alloc import unsafe_alloc
 from std.runtime import parallelism_level
 from max.algorithm import parallelize
 
-from tensor import FPtr, NW, F32V, WeightMatrix, DenseMatrix
+from tensor import (
+    FPtr,
+    NW,
+    F32V,
+    F32x16,
+    I16Ptr,
+    I16x32,
+    I32x16,
+    WeightMatrix,
+    DenseMatrix,
+    dot_pairs,
+)
 
 comptime MAX_PARTS = 64
 """Most threads gemv splits a matrix across; sizes its scratch buffer."""
@@ -419,6 +430,131 @@ def rows_dot[
             t += 1
 
 
+def quantize_rows(x: FPtr, T: Int, IN: Int, xq: I16Ptr, sx: FPtr):
+    """Quantizes each row of x[T, IN] to int16, symmetric, with one scale per
+    row: sx[t] = max|x[t]| / 32767 and xq[t] = round(x[t] / sx[t])."""
+    for t in range(T):
+        var row = x.unsafe_offset(t * IN)
+        var mx = F32V(0)
+        for i in range(0, IN, NW):
+            mx = max(mx, abs(row.unsafe_load[width=NW](i)))
+        var s = mx.reduce_max() / 32767
+        if s == 0:
+            s = 1
+        sx[unsafe_offset=t] = s
+        var inv = F32V(1 / s)
+        var dst = xq.unsafe_offset(t * IN)
+        for i in range(0, IN, NW):
+            var q = round(row.unsafe_load[width=NW](i) * inv)
+            dst.unsafe_store(i, q.cast[DType.int16]())
+
+
+def matmul_rows_a16[
+    W: WeightMatrix, //, RESID: Bool = False, GELU: Bool = False, BIAS: Bool = True
+](out_: FPtr, x: FPtr, w: W, b: FPtr, T: Int, IN: Int, OUT: Int):
+    """Computes out[T, OUT] (+)= act(x[T, IN] @ w[OUT, IN]^T + b[OUT]) in
+    integers: W4A16 / W8A16, for ACT16 formats (QuantMatrix[..., A16=True]).
+
+    x is first quantized to int16 per row (quantize_rows). Then, per output
+    row and quantization group, int16 activations times int16 weight codes
+    (minus the zero point) are summed in int32 with VPDPWSSD; each group's
+    sum takes the group's scale, and the row's result the activations'
+    scale.
+
+    - One token (decode): threads split the output rows; w.dot_row_i16
+      unpacks and multiplies in one pass.
+    - Several tokens (prefill): each output row is unpacked to int16 once and
+      reused for 4 tokens at a time.
+    """
+    var xq = unsafe_alloc[Int16](T * IN)
+    var sx = unsafe_alloc[Float32](T)
+    quantize_rows(x, T, IN, xq, sx)
+    comptime RB = 16  # output rows per task
+
+    if T == 1:
+
+        def one(ti: Int) {imm}:
+            var s = sx[unsafe_offset=0]
+            for o in range(ti * RB, min(OUT, (ti + 1) * RB)):
+                var r = w.dot_row_i16(o, xq) * s
+                comptime if BIAS:
+                    r += b[unsafe_offset=o]
+                finish[RESID, GELU](out_, o, r)
+
+        parallelize(one, (OUT + RB - 1) // RB)
+    else:
+        var G = w.group_size()
+
+        def rows(ti: Int) {imm}:
+            var wq = unsafe_alloc[Int16](IN)
+            var ws = unsafe_alloc[Float32](IN // G)
+            for o in range(ti * RB, min(OUT, (ti + 1) * RB)):
+                w.unpack_row_i16(o, wq, ws)
+                var bias = Float32(0)
+                comptime if BIAS:
+                    bias = b[unsafe_offset=o]
+                var t = 0
+                while t + 4 <= T:
+                    var d = dot4_i16(wq, ws, xq.unsafe_offset(t * IN), IN, G)
+                    comptime for k in range(4):
+                        finish[RESID, GELU](
+                            out_,
+                            (t + k) * OUT + o,
+                            d[k] * sx[unsafe_offset = t + k] + bias,
+                        )
+                    t += 4
+                while t < T:
+                    var d = dot1_i16(wq, ws, xq.unsafe_offset(t * IN), IN, G)
+                    finish[RESID, GELU](
+                        out_, t * OUT + o, d * sx[unsafe_offset=t] + bias
+                    )
+                    t += 1
+            wq.unsafe_free()
+            ws.unsafe_free()
+
+        parallelize(rows, (OUT + RB - 1) // RB)
+    xq.unsafe_free()
+    sx.unsafe_free()
+
+
+@always_inline
+def dot1_i16(wq: I16Ptr, ws: FPtr, xq: I16Ptr, IN: Int, G: Int) -> Float32:
+    """sum over groups of ws[g] * sum(wq * xq) for one row of activations."""
+    var accf = F32x16(0)
+    for g in range(IN // G):
+        var acc = I32x16(0)
+        for k in range(g * G, (g + 1) * G, 32):
+            acc = dot_pairs(
+                acc, xq.unsafe_load[width=32](k), wq.unsafe_load[width=32](k)
+            )
+        accf = acc.cast[DType.float32]().fma(F32x16(ws[unsafe_offset=g]), accf)
+    return accf.reduce_add()
+
+
+@always_inline
+def dot4_i16(
+    wq: I16Ptr, ws: FPtr, xq: I16Ptr, IN: Int, G: Int
+) -> SIMD[DType.float32, 4]:
+    """dot1_i16 for 4 consecutive activation rows at once, loading each
+    weight vector once for all 4."""
+    var accf = Array[F32x16, length=4](fill=F32x16(0))
+    for g in range(IN // G):
+        var acc = Array[I32x16, length=4](fill=I32x16(0))
+        for k in range(g * G, (g + 1) * G, 32):
+            var wv = wq.unsafe_load[width=32](k)
+            comptime for r in range(4):
+                acc[r] = dot_pairs(
+                    acc[r], xq.unsafe_load[width=32](r * IN + k), wv
+                )
+        var s = F32x16(ws[unsafe_offset=g])
+        comptime for r in range(4):
+            accf[r] = acc[r].cast[DType.float32]().fma(s, accf[r])
+    var out = SIMD[DType.float32, 4](0)
+    comptime for r in range(4):
+        out[r] = accf[r].reduce_add()
+    return out
+
+
 def linear[
     W: WeightMatrix, //, RESID: Bool = False, GELU: Bool = False
 ](
@@ -432,7 +568,9 @@ def linear[
     scratch: FPtr,
 ):
     """out[T, OUT] (+)= act(x @ w + b), with the kernel for w's layout."""
-    comptime if W.OUT_MAJOR:
+    comptime if W.ACT16:
+        matmul_rows_a16[RESID=RESID, GELU=GELU](out_, x, w, b, T, IN, OUT)
+    elif W.OUT_MAJOR:
         matmul_rows[RESID=RESID, GELU=GELU](out_, x, w, b, T, IN, OUT)
     else:
         matmul[RESID=RESID, GELU=GELU](out_, x, w, b, T, IN, OUT, scratch)
@@ -440,7 +578,9 @@ def linear[
 
 def head[W: WeightMatrix, //](logits: FPtr, h: FPtr, w: W, T: Int, V: Int, C: Int):
     """logits[T, V] = h[T, C] @ w[V, C]^T: the output head, for T rows."""
-    comptime if W.OUT_MAJOR:
+    comptime if W.ACT16:
+        matmul_rows_a16[BIAS=False](logits, h, w, h, T, C, V)
+    elif W.OUT_MAJOR:
         matmul_rows[BIAS=False](logits, h, w, h, T, C, V)
     else:
         if T == 1:

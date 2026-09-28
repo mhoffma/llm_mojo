@@ -12,7 +12,9 @@ Usage:
 
     --dtype FMT  weight format: f32 (default), f16, bf16, or quantized
                  int8-ch, int4-ch, int4-g128, int4-g64, int4-g32, each
-                 also with a -sym suffix (see tensor.mojo QuantMatrix)
+                 also with a -sym suffix (see tensor.mojo QuantMatrix), and
+                 -a16 variants (int8-ch-a16, int4-g32-a16, ...) that compute
+                 with int16 activations in integers
     -m DIR       directory with the Hugging Face GPT-2 files (default: gpt2)
     -n TOKENS    number of tokens to generate (default: 64)
     -t TEMP      sampling temperature; 0 = greedy (default: 0.8)
@@ -857,6 +859,8 @@ def model_name[W: WeightMatrix, E: WeightMatrix]() -> String:
 comptime HEAD8 = QuantMatrix[8, 0, False]
 """The output head format for quantized layers: int8, one scale and zero
 point per vocabulary row."""
+comptime HEAD8_A16 = QuantMatrix[8, 0, False, True]
+"""The same, computed in integers with int16 activations (for -a16 formats)."""
 
 
 def run[W: WeightMatrix, E: WeightMatrix = W](args: Args) raises:
@@ -869,7 +873,10 @@ def run[W: WeightMatrix, E: WeightMatrix = W](args: Args) raises:
 def run_quantized[W: WeightMatrix](args: Args) raises:
     """Runs a quantized layer format with the head chosen by --head."""
     if args.head == "int8":
-        run[W, HEAD8](args)
+        comptime if W.ACT16:
+            run[W, HEAD8_A16](args)
+        else:
+            run[W, HEAD8](args)
     elif args.head == "same":
         run[W, W](args)
     else:
@@ -909,5 +916,19 @@ def main() raises:
         run_quantized[QuantMatrix[4, 32, False]](args)
     elif args.dtype == "int4-g32-sym":
         run_quantized[QuantMatrix[4, 32, True]](args)
+    # W4A16 / W8A16: the same weights, with int16 activations and integer
+    # arithmetic (kernels.matmul_rows_a16).
+    elif args.dtype == "int8-ch-a16":
+        run_quantized[QuantMatrix[8, 0, False, True]](args)
+    elif args.dtype == "int4-ch-a16":
+        run_quantized[QuantMatrix[4, 0, False, True]](args)
+    elif args.dtype == "int4-g128-a16":
+        run_quantized[QuantMatrix[4, 128, False, True]](args)
+    elif args.dtype == "int4-g64-a16":
+        run_quantized[QuantMatrix[4, 64, False, True]](args)
+    elif args.dtype == "int4-g32-a16":
+        run_quantized[QuantMatrix[4, 32, False, True]](args)
+    elif args.dtype == "int4-g32-sym-a16":
+        run_quantized[QuantMatrix[4, 32, True, True]](args)
     else:
         raise Error("unknown --dtype " + args.dtype + " (see --help in PLAN.md)")

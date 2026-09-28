@@ -315,6 +315,7 @@ struct GGUFMatrix(WeightMatrix):
 
     comptime OUT_MAJOR = True
     comptime FROM_GGUF = True
+    comptime ACT16 = False
 
     var data: BPtr
     var kind: Int

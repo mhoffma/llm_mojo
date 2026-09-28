@@ -13,6 +13,8 @@ exactly the plain SIMD load the untyped gpt2.mojo does.
 """
 
 from std.memory.alloc import unsafe_alloc
+from std.sys.info import CompilationTarget
+from std.sys.intrinsics import llvm_intrinsic
 from std.sys import simd_width_of, size_of
 from std.os import abort
 from std.math import round
@@ -21,6 +23,24 @@ comptime FPtr = Pointer[Float32, MutUntrackedOrigin]
 comptime NW = simd_width_of[DType.float32]()
 comptime F32V = SIMD[DType.float32, NW]
 comptime F32x16 = SIMD[DType.float32, 16]
+comptime I16Ptr = Pointer[Int16, MutUntrackedOrigin]
+comptime I16x32 = SIMD[DType.int16, 32]
+comptime I32x16 = SIMD[DType.int32, 16]
+
+
+@always_inline
+def dot_pairs(acc: I32x16, a: I16x32, b: I16x32) -> I32x16:
+    """acc[i] + a[2i]*b[2i] + a[2i+1]*b[2i+1]: int16 products summed into
+    int32. One VPDPWSSD instruction with AVX-512 VNNI (see
+    research/test_vnni.mojo); otherwise portable, much slower SIMD code."""
+    comptime if CompilationTarget.has_vnni():
+        return llvm_intrinsic[
+            "llvm.x86.avx512.vpdpwssd.512", I32x16, has_side_effect=False
+        ](acc, a, b)
+    else:
+        var p = a.cast[DType.int32]() * b.cast[DType.int32]()
+        var halves = p.deinterleave()
+        return acc + halves[0] + halves[1]
 
 
 trait WeightMatrix(Deinitable, ImplicitlyCopyable):
@@ -39,6 +59,11 @@ trait WeightMatrix(Deinitable, ImplicitlyCopyable):
     comptime FROM_GGUF: Bool
     """True if matrices of this format are read from a GGUF file as stored
     (GGUFMatrix), False if they are converted from float32 with from_f32."""
+
+    comptime ACT16: Bool
+    """True if matmuls with this format quantize their input activations to
+    int16 and compute in integers (kernels.matmul_rows_a16), using the
+    *_i16 methods below. Only QuantMatrix[..., A16=True] does."""
 
     @staticmethod
     def name() -> String:
@@ -71,6 +96,21 @@ trait WeightMatrix(Deinitable, ImplicitlyCopyable):
         """Returns the dot product of row `row` with x[cols]."""
         ...
 
+    def dot_row_i16(self, row: Int, xq: I16Ptr) -> Float32:
+        """For ACT16 formats: the dot product of row `row` with int16
+        activations xq[cols], in the weights' float scale (the caller
+        multiplies by the activations' scale)."""
+        abort("dot_row_i16: this format has no integer kernel")
+
+    def unpack_row_i16(self, row: Int, dst: I16Ptr, scales: FPtr):
+        """For ACT16 formats: writes row `row` as int16 codes minus the zero
+        point (dst[cols]) and its group scales (scales[cols / group])."""
+        abort("unpack_row_i16: this format has no integer kernel")
+
+    def group_size(self) -> Int:
+        """For ACT16 formats: weights per quantization group."""
+        return 0
+
     def nbytes(self) -> Int:
         """Bytes of storage, to report the model's size."""
         ...
@@ -98,6 +138,7 @@ struct DenseMatrix[dtype: DType](WeightMatrix):
 
     comptime OUT_MAJOR = False
     comptime FROM_GGUF = False
+    comptime ACT16 = False
 
     var data: Pointer[Scalar[Self.dtype], MutUntrackedOrigin]
     var rows: Int
@@ -148,7 +189,9 @@ struct DenseMatrix[dtype: DType](WeightMatrix):
         self.data.unsafe_free()
 
 
-struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
+struct QuantMatrix[
+    BITS: Int, GROUP: Int, SYMMETRIC: Bool, A16: Bool = False
+](WeightMatrix):
     """Affine-quantized weights: BITS-bit codes with a scale and an integer
     zero point per group of GROUP weights along the reduction axis.
 
@@ -180,14 +223,22 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
 
     In a dot product, the scale and zero point factor out of each group:
     sum(x * w) = scale * sum(x * (u - zero_point)). `dot_row` applies the
-    scale once per group, and the integer kernel (M4) will keep the inner sum
-    in integers.
+    scale once per group.
+
+    With A16 (W4A16 / W8A16), matmuls quantize their inputs to int16 and the
+    inner sums run in integers: `dot_row_i16` unpacks 32 codes to int16,
+    subtracts the zero point, and multiplies-and-adds them with 32 int16
+    activations in one VPDPWSSD; each group's int32 sums then take the
+    group's scale in float. |x_q| <= 32767 and |u - zero_point| <= 255, so a
+    lane gathers at most 2 * 32767 * 255 per 32 weights, and even a 3072-wide
+    group stays below 2^31.
 
     Rounding is plain round-to-nearest.
     """
 
     comptime OUT_MAJOR = True
     comptime FROM_GGUF = False
+    comptime ACT16 = Self.A16
     comptime LEVELS = (1 << Self.BITS) - 1  # largest code
     comptime HALF = 1 << (Self.BITS - 1)  # the zero point when symmetric
 
@@ -218,7 +269,9 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
     def name() -> String:
         var g = String("ch") if Self.GROUP == 0 else "g" + String(Self.GROUP)
         var s = "int" + String(Self.BITS) + "-" + g
-        return s + "-sym" if Self.SYMMETRIC else s
+        if Self.SYMMETRIC:
+            s += "-sym"
+        return s + "-a16" if Self.A16 else s
 
     @staticmethod
     def from_f32(src: FPtr, rows: Int, cols: Int, reduce_rows: Bool) -> Self:
@@ -325,6 +378,51 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
 
     def dot_row(self, row: Int, x: FPtr) -> Float32:
         return self.row_op[True](row, x, x).reduce_add()
+
+    @always_inline
+    def codes_i16(self, p: Pointer[UInt8, MutUntrackedOrigin], k0: Int, zp: I16x32) -> I16x32:
+        """32 codes starting at column k0 of the row at p, as int16, minus
+        the zero point. With the Q4_0-style packing, the low nibbles of 16
+        bytes are weights k0..k0+15 and the high nibbles k0+16..k0+31, so
+        joining them gives the 32 weights in order."""
+        var u: SIMD[DType.uint8, 32]
+        comptime if Self.BITS == 4:
+            var b = p.unsafe_load[width=16](k0 // 2)
+            u = (b & 0xF).join(b >> 4)
+        else:
+            u = p.unsafe_load[width=32](k0)
+        return u.cast[DType.int16]() - zp
+
+    def dot_row_i16(self, row: Int, xq: I16Ptr) -> Float32:
+        var p = self.data.unsafe_offset(row * self.cols * Self.BITS // 8)
+        var gpr = self.cols // self.group
+        var accf = F32x16(0)
+        for g in range(gpr):
+            var zp = I16x32(Int16(Int(self.zero_point[unsafe_offset = row * gpr + g])))
+            var acc = I32x16(0)
+            for c in range(self.group // 32):
+                var k0 = g * self.group + 32 * c
+                acc = dot_pairs(
+                    acc, xq.unsafe_load[width=32](k0), self.codes_i16(p, k0, zp)
+                )
+            var s = self.scale[unsafe_offset = row * gpr + g].cast[DType.float32]()
+            accf = acc.cast[DType.float32]().fma(F32x16(s), accf)
+        return accf.reduce_add()
+
+    def unpack_row_i16(self, row: Int, dst: I16Ptr, scales: FPtr):
+        var p = self.data.unsafe_offset(row * self.cols * Self.BITS // 8)
+        var gpr = self.cols // self.group
+        for g in range(gpr):
+            var zp = I16x32(Int16(Int(self.zero_point[unsafe_offset = row * gpr + g])))
+            scales[unsafe_offset=g] = self.scale[unsafe_offset = row * gpr + g].cast[
+                DType.float32
+            ]()
+            for c in range(self.group // 32):
+                var k0 = g * self.group + 32 * c
+                dst.unsafe_store(k0, self.codes_i16(p, k0, zp))
+
+    def group_size(self) -> Int:
+        return self.group
 
     def load[width: Int](self, row: Int, col: Int) -> SIMD[DType.float32, width]:
         """Slow path, for completeness: dequantizes the whole row. The
