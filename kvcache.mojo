@@ -10,7 +10,7 @@ weights' (tensor.WeightMatrix), and so is how attention computes with them:
   `attend` (compute attention), nbytes, free.
 - `FloatKV(KVCache)`: caches read in float32 through `score` (q · k) and
   `add_value` (acc += p * v). They share one attention implementation,
-  `attend_float`, the original float32 attention (bit-identical).
+  `attend_float_one`, the original float32 attention (bit-identical).
   - DenseKV[dtype]: float32 (the original cache), float16, bfloat16.
   - QuantKV[BITS]: int16 / int8 with a scale per (layer, position, head).
 - IntAttnKV (int_attention.mojo): int8 keys and values in layouts built for
@@ -50,13 +50,33 @@ trait KVCache(Deinitable, ImplicitlyCopyable):
         values each) at `pos` of `layer`."""
         ...
 
+    def attend_one[
+        N_HEAD: Int, HS: Int
+    ](self, out_: FPtr, qkv: FPtr, layer: Int, t: Int, h: Int, pos0: Int):
+        """Causal attention of token t (at position pos0 + t) for head h of
+        `layer`: its query from qkv row t ([T, 3C]), keys and values from
+        this cache (positions 0 .. pos0+t), output into row t of out ([T, C]).
+        """
+        ...
+
     def attend[
         N_HEAD: Int, HS: Int
     ](self, out_: FPtr, qkv: FPtr, layer: Int, T: Int, pos0: Int):
         """Causal attention for T new tokens at positions pos0.. of `layer`:
-        queries from qkv ([T, 3C]), keys and values from this cache (which
-        already holds positions 0 .. pos0+T-1), float32 output [T, C]."""
-        ...
+        attend_one for every token and head, in parallel when there is
+        enough work (waking the worker threads costs more than a
+        short-context decode step's attention)."""
+
+        def one(idx: Int) {imm}:
+            self.attend_one[N_HEAD, HS](
+                out_, qkv, layer, idx // N_HEAD, idx % N_HEAD, pos0
+            )
+
+        if T * (pos0 + T) < 256:
+            for i in range(N_HEAD * T):
+                one(i)
+        else:
+            parallelize(one, N_HEAD * T)
 
     def nbytes(self) -> Int:
         """Bytes of storage, to report."""
@@ -69,7 +89,7 @@ trait KVCache(Deinitable, ImplicitlyCopyable):
 
 trait FloatKV(KVCache):
     """A cache that attention reads in float32, one position and head at a
-    time. Such formats implement `attend` with `attend_float`."""
+    time. Such formats implement `attend_one` with `attend_float_one`."""
 
     def score[HS: Int](self, layer: Int, pos: Int, head: Int, q: FPtr) -> Float32:
         """Returns q · k for the key at (layer, pos, head); q has HS values.
@@ -90,58 +110,44 @@ trait FloatKV(KVCache):
         ...
 
 
-def attend_float[
+def attend_float_one[
     KV: FloatKV, //, N_HEAD: Int, HS: Int
-](kv: KV, out_: FPtr, qkv: FPtr, layer: Int, T: Int, pos0: Int):
-    """Float32 attention through FloatKV's score / add_value: the original
-    attention kernel, moved here unchanged."""
+](kv: KV, out_: FPtr, qkv: FPtr, layer: Int, t: Int, h: Int, pos0: Int):
+    """Float32 attention of token t, head h, through FloatKV's score /
+    add_value: the original attention kernel's per-head body, unchanged."""
     comptime C = N_HEAD * HS
     var scale = 1 / sqrt(Float32(HS))
-
-    def head_query(idx: Int) {imm}:
-        var h = idx % N_HEAD
-        var t = idx // N_HEAD
-        var npos = pos0 + t + 1
-        var q = qkv.unsafe_offset(t * 3 * C + h * HS)
-        var scores = unsafe_alloc[Float32](npos)
-        var mx = Float32.MIN
-        for s in range(npos):
-            var sc = kv.score[HS](layer, s, h, q) * scale
-            scores[unsafe_offset=s] = sc
-            mx = max(mx, sc)
-        # Exponentials 16 at a time: SIMD exp gives exactly the scalar
-        # results lane by lane, and it's ~14x faster than one exp per call
-        # (research/test_softmax.mojo). The sum stays in the original order,
-        # so float32 results are unchanged bit for bit.
-        var s0 = 0
-        var mv = F32V(mx)
-        while s0 + NW <= npos:
-            scores.unsafe_store(s0, exp(scores.unsafe_load[width=NW](s0) - mv))
-            s0 += NW
-        while s0 < npos:
-            scores[unsafe_offset=s0] = exp(scores[unsafe_offset=s0] - mx)
-            s0 += 1
-        var total = Float32(0)
-        for s in range(npos):
-            total += scores[unsafe_offset=s]
-        var o = out_.unsafe_offset(t * C + h * HS)
-        var acc = Array[F32V, length = HS // NW](fill=F32V(0))
-        for s in range(npos):
-            var p = F32V(scores[unsafe_offset=s] / total)
-            kv.add_value[HS](layer, s, h, p, acc)
-        comptime for i in range(HS // NW):
-            o.unsafe_store(i * NW, acc[i])
-        scores.unsafe_free()
-
-    # Waking the worker threads costs more than a short-context decode step's
-    # attention, so only go parallel when there is enough work.
-    if T * (pos0 + T) < 256:
-        for i in range(N_HEAD * T):
-            head_query(i)
-    else:
-        parallelize(head_query, N_HEAD * T)
-
-
+    var npos = pos0 + t + 1
+    var q = qkv.unsafe_offset(t * 3 * C + h * HS)
+    var scores = unsafe_alloc[Float32](npos)
+    var mx = Float32.MIN
+    for s in range(npos):
+        var sc = kv.score[HS](layer, s, h, q) * scale
+        scores[unsafe_offset=s] = sc
+        mx = max(mx, sc)
+    # Exponentials 16 at a time: SIMD exp gives exactly the scalar results
+    # lane by lane, and it's ~14x faster than one exp per call
+    # (research/test_softmax.mojo). The sum stays in the original order, so
+    # float32 results are unchanged bit for bit.
+    var s0 = 0
+    var mv = F32V(mx)
+    while s0 + NW <= npos:
+        scores.unsafe_store(s0, exp(scores.unsafe_load[width=NW](s0) - mv))
+        s0 += NW
+    while s0 < npos:
+        scores[unsafe_offset=s0] = exp(scores[unsafe_offset=s0] - mx)
+        s0 += 1
+    var total = Float32(0)
+    for s in range(npos):
+        total += scores[unsafe_offset=s]
+    var o = out_.unsafe_offset(t * C + h * HS)
+    var acc = Array[F32V, length = HS // NW](fill=F32V(0))
+    for s in range(npos):
+        var p = F32V(scores[unsafe_offset=s] / total)
+        kv.add_value[HS](layer, s, h, p, acc)
+    comptime for i in range(HS // NW):
+        o.unsafe_store(i * NW, acc[i])
+    scores.unsafe_free()
 
 
 struct DenseKV[dtype: DType](FloatKV):
@@ -226,10 +232,10 @@ struct DenseKV[dtype: DType](FloatKV):
         comptime for i in range(HS // NW):
             acc[i] = p.fma(vp.unsafe_load[width=NW](i * NW).cast[DType.float32](), acc[i])
 
-    def attend[
+    def attend_one[
         N_HEAD: Int, HS: Int
-    ](self, out_: FPtr, qkv: FPtr, layer: Int, T: Int, pos0: Int):
-        attend_float[N_HEAD, HS](self, out_, qkv, layer, T, pos0)
+    ](self, out_: FPtr, qkv: FPtr, layer: Int, t: Int, h: Int, pos0: Int):
+        attend_float_one[N_HEAD, HS](self, out_, qkv, layer, t, h, pos0)
 
     def nbytes(self) -> Int:
         return 2 * self.n_layer * self.max_t * self.dim * size_of[Scalar[Self.dtype]]()
@@ -363,10 +369,10 @@ struct QuantKV[BITS: Int](FloatKV):
         comptime for i in range(HS // NW):
             acc[i] = ps.fma(vp.unsafe_load[width=NW](i * NW).cast[DType.float32](), acc[i])
 
-    def attend[
+    def attend_one[
         N_HEAD: Int, HS: Int
-    ](self, out_: FPtr, qkv: FPtr, layer: Int, T: Int, pos0: Int):
-        attend_float[N_HEAD, HS](self, out_, qkv, layer, T, pos0)
+    ](self, out_: FPtr, qkv: FPtr, layer: Int, t: Int, h: Int, pos0: Int):
+        attend_float_one[N_HEAD, HS](self, out_, qkv, layer, t, h, pos0)
 
     def nbytes(self) -> Int:
         var n = self.n_layer * self.max_t * self.n_head

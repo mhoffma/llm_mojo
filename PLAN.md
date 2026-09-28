@@ -52,7 +52,7 @@ accuracy each format costs for that speed**.
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
 | M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) + integer attention | ✅ done: int8 cache default for quantized models (+10-16% long-context decode); `--attention int` (integer attention on an int8 VNNI-layout cache) another +9-15% long-context decode at no accuracy cost |
-| M6. Tuning and final results table | 🔄 profiling done (`--profile`); vectorized KV store, then fewer thread wake-ups next |
+| M6. Tuning and final results table | 🔄 profiling, vectorized KV store, one-region team decode (+~40% decode) done; output head and clean results run next |
 | M7. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
 ## Getting started
@@ -749,6 +749,24 @@ Next steps, in order:
    operations, as llama.cpp does.
 3. A faster output head (16% of decode).
 4. A clean results run of every format on a quiet machine.
+
+**Done (2026-09-28):**
+- `IntAttnKV.store` vectorized: ~3x faster (prompt share 8-11% -> 2-3%),
+  identical output.
+- `research/test_barrier.mojo`: parallel region ~23 us vs spin barrier
+  ~1 us.
+- Team decode (`team.mojo`, `kernels.linear_team` / `head_team`,
+  `KVCache.attend_one`, `Model.decode`): one parallel region per decoded
+  token, threads meet at a spin-then-yield barrier between operations.
+  Output identical to before for every format (f32 still bit-identical).
+  With 8 threads (4 cores x 2 hyperthreads) it was *slower* on a busy
+  machine (spinning siblings, descheduled members); with 4 threads (one per
+  core, now the default, `--threads N` to change):
+
+  | decode tok/s (short / long) | regions (before) | team, 8 threads | team, 4 threads |
+  |---|---|---|---|
+  | f16 | 100 / 90 | 74 / 65 | 138 / 116 |
+  | int4-g32-a16 --attention int | 167 / 152 | 102 / 109 | 237 / 224 |
 
 ### M7. Stretch
 

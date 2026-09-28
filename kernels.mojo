@@ -17,6 +17,7 @@ from std.runtime import parallelism_level
 from max.algorithm import parallelize
 
 from kvcache import KVCache
+from team import Team, split
 from tensor import (
     FPtr,
     NW,
@@ -683,3 +684,136 @@ def head[W: WeightMatrix, //](logits: FPtr, h: FPtr, w: W, T: Int, V: Int, C: In
             lm_head(logits, h, w, V, C)
         else:
             lm_head_rows(logits, h, w, T, V, C)
+
+
+# ===----------------------------------------------------------------------=== #
+# One-token kernels for a persistent team of threads (team.mojo)
+# ===----------------------------------------------------------------------=== #
+#
+# Decoding runs a whole step inside one parallel region: every thread of the
+# team calls these with its id, does its share, and meets the others at the
+# barrier that ends each function. They reproduce the region-per-call
+# kernels' partitioning and order of operations (gemv's bands and reduction,
+# lm_head's chunks, one dot product per row), so results are identical.
+
+
+def linear_team[
+    W: WeightMatrix, //, RESID: Bool = False, GELU: Bool = False, BIAS: Bool = True
+](
+    tid: Int,
+    team: Team,
+    out_: FPtr,
+    x: FPtr,
+    w: W,
+    b: FPtr,
+    IN: Int,
+    OUT: Int,
+    scratch: FPtr,
+    xq: I16Ptr,
+    xp: I16Ptr,
+    xs: FPtr,
+    sx: FPtr,
+):
+    """One token: out[OUT] (+)= act(x[IN] @ w + b), by thread tid of the
+    team; ends with a barrier.
+
+    scratch: gemv partial sums (nt * OUT floats). xq, xp (IN int16 each), xs
+    (IN / 16 floats) and sx (2 floats) are the integer path's quantized and
+    permuted activations and their scale.
+    """
+    var nt = team.nt
+    comptime if W.ACT16:
+        # Thread 0 quantizes (and, for layouts that need it, reorders) the
+        # activations; everyone then computes its rows.
+        if tid == 0:
+            quantize_rows(x, 1, IN, xq, sx)
+            sx[unsafe_offset=1] = 1 if w.permute_x_i16(xq, IN, xp, xs) else 0
+        team.wait()
+        var x1 = xp if sx[unsafe_offset=1] != 0 else xq
+        var s = sx[unsafe_offset=0]
+        var r = split(OUT, tid, nt)
+        for o in range(r[0], r[1]):
+            var v = w.dot_row_i16(o, x1, xs) * s
+            comptime if BIAS:
+                v += b[unsafe_offset=o]
+            finish[RESID, GELU](out_, o, v)
+    elif W.OUT_MAJOR:
+        var r = split(OUT, tid, nt)
+        for o in range(r[0], r[1]):
+            var v = w.dot_row(o, x)
+            comptime if BIAS:
+                v += b[unsafe_offset=o]
+            finish[RESID, GELU](out_, o, v)
+    else:
+        # gemv: thread tid is part tid (the same bands as gemv with
+        # nparts = nt), then the partial sums are added in the same order.
+        var rows = (IN + nt - 1) // nt
+        var acc = scratch.unsafe_offset(tid * OUT)
+        for j in range(0, OUT, NW):
+            acc.unsafe_store(j, F32V(0))
+        var i = tid * rows
+        var end = min(IN, i + rows)
+        while i + 4 <= end:
+            var x0 = F32V(x[unsafe_offset=i])
+            var x1 = F32V(x[unsafe_offset = i + 1])
+            var x2 = F32V(x[unsafe_offset = i + 2])
+            var x3 = F32V(x[unsafe_offset = i + 3])
+            for j in range(0, OUT, NW):
+                var s = acc.unsafe_load[width=NW](j)
+                s = x0.fma(w.load[NW](i, j), s)
+                s = x1.fma(w.load[NW](i + 1, j), s)
+                s = x2.fma(w.load[NW](i + 2, j), s)
+                s = x3.fma(w.load[NW](i + 3, j), s)
+                acc.unsafe_store(j, s)
+            i += 4
+        while i < end:
+            var xi = F32V(x[unsafe_offset=i])
+            for j in range(0, OUT, NW):
+                acc.unsafe_store(
+                    j, xi.fma(w.load[NW](i, j), acc.unsafe_load[width=NW](j))
+                )
+            i += 1
+        team.wait()
+        var cr = split(OUT // NW, tid, nt)
+        for c in range(cr[0], cr[1]):
+            var j = c * NW
+            var v = F32V(0)
+            comptime if BIAS:
+                v = b.unsafe_load[width=NW](j)
+            for pi in range(nt):
+                v += scratch.unsafe_load[width=NW](pi * OUT + j)
+            store_out[RESID, GELU](out_, j, v)
+    team.wait()
+
+
+def head_team[
+    W: WeightMatrix, //
+](
+    tid: Int,
+    team: Team,
+    logits: FPtr,
+    h: FPtr,
+    w: W,
+    V: Int,
+    C: Int,
+    xq: I16Ptr,
+    xp: I16Ptr,
+    xs: FPtr,
+    sx: FPtr,
+):
+    """One token: logits[V] = h[C] @ w[V, C]^T, by thread tid of the team;
+    ends with a barrier. Same arithmetic as `head` for T = 1."""
+    comptime if W.OUT_MAJOR:
+        linear_team[BIAS=False](tid, team, logits, h, w, h, C, V, h, xq, xp, xs, sx)
+    else:
+        # lm_head's 512-row chunks, divided among the threads.
+        comptime CHUNK = 512
+        var r = split((V + CHUNK - 1) // CHUNK, tid, team.nt)
+        for ci in range(r[0], r[1]):
+            var end = min(V, (ci + 1) * CHUNK)
+            for v in range(ci * CHUNK, end):
+                var d = F32V(0)
+                for i in range(0, C, NW):
+                    d = h.unsafe_load[width=NW](i).fma(w.load[NW](v, i), d)
+                logits[unsafe_offset=v] = d.reduce_add()
+        team.wait()

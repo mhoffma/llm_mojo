@@ -139,132 +139,135 @@ struct IntAttnKV(KVCache):
 
     def quantize_head(self, x: FPtr, layer: Int, h: Int, pos: Int, key: Bool) -> Int32:
         """Quantizes one head's values to int8 into the key or value layout;
-        returns the scale * 2^24."""
-        var mx = Float32(0)
-        for d in range(self.head_dim):
-            mx = max(mx, abs(x[unsafe_offset=d]))
-        var s = mx / 127
+        returns the scale * 2^24.
+
+        16 values at a time: keys are written as int16 pairs (dimensions d,
+        d+1 are adjacent in the key layout, and successive pairs are PB * 2
+        bytes apart); values are written at a stride of 2 bytes (the two
+        positions of a pair are interleaved)."""
+        var mx = F32V(0)
+        for d in range(0, self.head_dim, NW):
+            mx = max(mx, abs(x.unsafe_load[width=NW](d)))
+        var s = mx.reduce_max() / 127
         if s == 0:
             s = 1
-        var inv = 1 / s
-        for d in range(self.head_dim):
-            var c = Int8(Int(round(x[unsafe_offset=d] * inv)))
-            if key:
-                self.k[unsafe_offset = self.k_at(layer, h, pos, d)] = c
-            else:
-                self.v[unsafe_offset = self.v_at(layer, h, pos, d)] = c
+        var inv = F32V(1 / s)
+        if key:
+            var kp = self.k.unsafe_offset(self.k_at(layer, h, pos, 0)).unsafe_bitcast[Int16]()
+            for d in range(0, self.head_dim, NW):
+                var c = round(x.unsafe_load[width=NW](d) * inv).cast[DType.int8]()
+                var pairs = bitcast[DType.int16, NW // 2](c)
+                comptime for j in range(NW // 2):
+                    kp[unsafe_offset = (d // 2 + j) * PB] = pairs[j]
+        else:
+            var vp = self.v.unsafe_offset(self.v_at(layer, h, pos, 0))
+            for d in range(0, self.head_dim, NW):
+                var c = round(x.unsafe_load[width=NW](d) * inv).cast[DType.int8]()
+                comptime for j in range(NW):
+                    vp[unsafe_offset = 2 * (d + j)] = c[j]
         return Int32(Int(round(Float64(s) * Float64(1 << KS))))
 
-    def attend[
+    def attend_one[
         N_HEAD: Int, HS: Int
-    ](self, out_: FPtr, qkv: FPtr, layer: Int, T: Int, pos0: Int):
+    ](self, out_: FPtr, qkv: FPtr, layer: Int, t: Int, h: Int, pos0: Int):
         comptime C = N_HEAD * HS
         var mult = exp_multiplier(1.0 / Float64(1 << SF))
+        var npos = pos0 + t + 1
+        var nr = (npos + PB - 1) // PB * PB
+        var q = qkv.unsafe_offset(t * 3 * C + h * HS)
+        var qi = unsafe_alloc[Int16](HS)
+        var scores = unsafe_alloc[Int32](nr)
+        var e = unsafe_alloc[Int32](nr)
+        var w = unsafe_alloc[Int16](nr + 2)
 
-        def head_query(idx: Int) {imm}:
-            var h = idx % N_HEAD
-            var t = idx // N_HEAD
-            var npos = pos0 + t + 1
-            var nr = (npos + PB - 1) // PB * PB
-            var q = qkv.unsafe_offset(t * 3 * C + h * HS)
-            var qi = unsafe_alloc[Int16](HS)
-            var scores = unsafe_alloc[Int32](nr)
-            var e = unsafe_alloc[Int32](nr)
-            var w = unsafe_alloc[Int16](nr + 2)
-
-            # 1. Query -> int16.
-            var mq = F32V(0)
-            for d in range(0, HS, NW):
-                mq = max(mq, abs(q.unsafe_load[width=NW](d)))
-            var sq = mq.reduce_max() / 32767
-            if sq == 0:
-                sq = 1
-            var invq = F32V(1 / sq)
-            for d in range(0, HS, NW):
-                qi.unsafe_store(
-                    d, round(q.unsafe_load[width=NW](d) * invq).cast[DType.int16]()
-                )
-            var qm = Int(
-                round(Float64(sq) / sqrt(Float64(HS)) * Float64(1 << (SF + KS)))
+        # 1. Query -> int16.
+        var mq = F32V(0)
+        for d in range(0, HS, NW):
+            mq = max(mq, abs(q.unsafe_load[width=NW](d)))
+        var sq = mq.reduce_max() / 32767
+        if sq == 0:
+            sq = 1
+        var invq = F32V(1 / sq)
+        for d in range(0, HS, NW):
+            qi.unsafe_store(
+                d, round(q.unsafe_load[width=NW](d) * invq).cast[DType.int16]()
             )
-            var qm64 = SIMD[DType.int64, PB](qm)
+        var qm = Int(
+            round(Float64(sq) / sqrt(Float64(HS)) * Float64(1 << (SF + KS)))
+        )
+        var qm64 = SIMD[DType.int64, PB](qm)
 
-            # 2-3. Scores for 16 positions per block, then rescaled to 16
-            # fraction bits.
-            var q32 = qi.unsafe_bitcast[Int32]()  # query pairs
-            var ks = self.kq.unsafe_offset(self.lh(layer, h) * self.max_t)
-            for b in range(nr // PB):
-                var acc = I32x16(0)
-                var kb = self.k.unsafe_offset(self.k_at(layer, h, b * PB, 0))
-                comptime for j in range(HS // 2):
-                    var qp = bitcast[DType.int16, 32](I32x16(q32[unsafe_offset=j]))
-                    var kv = kb.unsafe_load[width=32](j * 2 * PB).cast[DType.int16]()
-                    acc = dot_pairs(acc, qp, kv)
-                var kqv = ks.unsafe_load[width=PB](b * PB).cast[DType.int64]()
-                var t1 = (acc.cast[DType.int64]() * kqv + (1 << (KS - 1))) >> KS
-                var sfix = (t1 * qm64 + (1 << (KS - 1))) >> KS
-                scores.unsafe_store(b * PB, sfix.cast[DType.int32]())
+        # 2-3. Scores for 16 positions per block, then rescaled to 16
+        # fraction bits.
+        var q32 = qi.unsafe_bitcast[Int32]()  # query pairs
+        var ks = self.kq.unsafe_offset(self.lh(layer, h) * self.max_t)
+        for b in range(nr // PB):
+            var acc = I32x16(0)
+            var kb = self.k.unsafe_offset(self.k_at(layer, h, b * PB, 0))
+            comptime for j in range(HS // 2):
+                var qp = bitcast[DType.int16, 32](I32x16(q32[unsafe_offset=j]))
+                var kv = kb.unsafe_load[width=32](j * 2 * PB).cast[DType.int16]()
+                acc = dot_pairs(acc, qp, kv)
+            var kqv = ks.unsafe_load[width=PB](b * PB).cast[DType.int64]()
+            var t1 = (acc.cast[DType.int64]() * kqv + (1 << (KS - 1))) >> KS
+            var sfix = (t1 * qm64 + (1 << (KS - 1))) >> KS
+            scores.unsafe_store(b * PB, sfix.cast[DType.int32]())
 
-            # 4. Unnormalized integer softmax over positions 0 .. npos-1.
-            var total = masked_exp[False](scores, scores, npos, mult, e)
+        # 4. Unnormalized integer softmax over positions 0 .. npos-1.
+        var total = masked_exp[False](scores, scores, npos, mult, e)
 
-            # 5. Fold the value scales into the weights, relative to the
-            # largest one in this head.
-            var vs = self.vq.unsafe_offset(self.lh(layer, h) * self.max_t)
-            var vmax = 0
-            for s in range(npos):
-                vmax = max(vmax, Int(vs[unsafe_offset=s]))
-            var o = out_.unsafe_offset(t * C + h * HS)
-            if vmax == 0 or total == 0:
-                for d in range(0, HS, NW):
-                    o.unsafe_store(d, F32V(0))
-            else:
-                var inv47 = SIMD[DType.int64, PB]((1 << 47) // vmax)
-                for b in range(nr // PB):
-                    var vv = vs.unsafe_load[width=PB](b * PB).cast[DType.int64]()
-                    var r16 = (vv * inv47) >> 31  # vq / vq_max in Q16
-                    var ee = e.unsafe_load[width=PB](b * PB).cast[DType.int64]()
-                    # e (Q30) * r (Q16) >> 31: Q15, at most 32768.
-                    var ww = min((ee * r16 + (1 << 30)) >> 31, SIMD[DType.int64, PB](32767))
-                    # Positions past npos have e = 0; their scale may be
-                    # anything (uninitialized), so zero them explicitly.
-                    w.unsafe_store(b * PB, ee.eq(0).select(SIMD[DType.int64, PB](0), ww).cast[DType.int16]())
-                w[unsafe_offset=nr] = 0
-                w[unsafe_offset = nr + 1] = 0
-
-                # Weighted sum of values, 2 positions per VPDPWSSD; the int32
-                # sums move to float every 256 positions (128 pairs).
-                var accf = Array[F32x16, length = HS // 16](fill=F32x16(0))
-                var w32 = w.unsafe_bitcast[Int32]()
-                var npairs = (npos + 1) // 2
-                for seg in range(0, npairs, 128):
-                    var accv = Array[I32x16, length = HS // 16](fill=I32x16(0))
-                    for pp2 in range(seg, min(npairs, seg + 128)):
-                        var wp = bitcast[DType.int16, 32](I32x16(w32[unsafe_offset=pp2]))
-                        var vb = self.v.unsafe_offset(self.v_at(layer, h, 2 * pp2, 0))
-                        comptime for c in range(HS // 16):
-                            var vv8 = vb.unsafe_load[width=32](c * 32).cast[DType.int16]()
-                            accv[c] = dot_pairs(accv[c], wp, vv8)
-                    comptime for c in range(HS // 16):
-                        accf[c] += accv[c].cast[DType.float32]()
-
-                # 6. Back to float: * (vq_max / 2^24) * 2^15 / E.
-                var fs = F32x16(
-                    Float32(Float64(vmax) * Float64(1 << 15) / (Float64(1 << KS) * Float64(total)))
-                )
-                comptime for c in range(HS // 16):
-                    o.unsafe_store(c * 16, accf[c] * fs)
-
-            qi.unsafe_free()
-            scores.unsafe_free()
-            e.unsafe_free()
-            w.unsafe_free()
-
-        if T * (pos0 + T) < 256:
-            for i in range(N_HEAD * T):
-                head_query(i)
+        # 5. Fold the value scales into the weights, relative to the
+        # largest one in this head.
+        var vs = self.vq.unsafe_offset(self.lh(layer, h) * self.max_t)
+        var vmax = 0
+        for s in range(npos):
+            vmax = max(vmax, Int(vs[unsafe_offset=s]))
+        var o = out_.unsafe_offset(t * C + h * HS)
+        if vmax == 0 or total == 0:
+            for d in range(0, HS, NW):
+                o.unsafe_store(d, F32V(0))
         else:
-            parallelize(head_query, N_HEAD * T)
+            var inv47 = SIMD[DType.int64, PB]((1 << 47) // vmax)
+            for b in range(nr // PB):
+                var vv = vs.unsafe_load[width=PB](b * PB).cast[DType.int64]()
+                var r16 = (vv * inv47) >> 31  # vq / vq_max in Q16
+                var ee = e.unsafe_load[width=PB](b * PB).cast[DType.int64]()
+                # e (Q30) * r (Q16) >> 31: Q15, at most 32768.
+                var ww = min((ee * r16 + (1 << 30)) >> 31, SIMD[DType.int64, PB](32767))
+                # Positions past npos have e = 0; their scale may be
+                # anything (uninitialized), so zero them explicitly.
+                w.unsafe_store(b * PB, ee.eq(0).select(SIMD[DType.int64, PB](0), ww).cast[DType.int16]())
+            w[unsafe_offset=nr] = 0
+            w[unsafe_offset = nr + 1] = 0
+
+            # Weighted sum of values, 2 positions per VPDPWSSD; the int32
+            # sums move to float every 256 positions (128 pairs).
+            var accf = Array[F32x16, length = HS // 16](fill=F32x16(0))
+            var w32 = w.unsafe_bitcast[Int32]()
+            var npairs = (npos + 1) // 2
+            for seg in range(0, npairs, 128):
+                var accv = Array[I32x16, length = HS // 16](fill=I32x16(0))
+                for pp2 in range(seg, min(npairs, seg + 128)):
+                    var wp = bitcast[DType.int16, 32](I32x16(w32[unsafe_offset=pp2]))
+                    var vb = self.v.unsafe_offset(self.v_at(layer, h, 2 * pp2, 0))
+                    comptime for c in range(HS // 16):
+                        var vv8 = vb.unsafe_load[width=32](c * 32).cast[DType.int16]()
+                        accv[c] = dot_pairs(accv[c], wp, vv8)
+                comptime for c in range(HS // 16):
+                    accf[c] += accv[c].cast[DType.float32]()
+
+            # 6. Back to float: * (vq_max / 2^24) * 2^15 / E.
+            var fs = F32x16(
+                Float32(Float64(vmax) * Float64(1 << 15) / (Float64(1 << KS) * Float64(total)))
+            )
+            comptime for c in range(HS // 16):
+                o.unsafe_store(c * 16, accf[c] * fs)
+
+        qi.unsafe_free()
+        scores.unsafe_free()
+        e.unsafe_free()
+        w.unsafe_free()
+
 
     def nbytes(self) -> Int:
         var n = self.n_layer * self.n_head * self.max_t

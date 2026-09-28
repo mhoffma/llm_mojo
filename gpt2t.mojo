@@ -30,6 +30,9 @@ Usage:
                  in VNNI layouts, integer softmax; int_attention.mojo)
     --profile    print time per operation (per decode and prompt token) at
                  the end
+    --threads N  threads that decode each token together (default: half
+                 the runtime's parallelism level, i.e. one per core with
+                 hyperthreading: 4 on a 4-core/8-thread CPU)
     --gguf FILE  use the weights in a llama.cpp GGUF file of GPT-2 124M
                  (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 tensors), as
                  stored; overrides --dtype. The tokenizer still comes from -m.
@@ -49,9 +52,19 @@ from std.math import exp, log
 from std.io import FileDescriptor
 from std.os import SEEK_END, SEEK_SET
 
-from tensor import FPtr, NW, F32V, WeightMatrix, DenseMatrix, QuantMatrix
+from tensor import FPtr, NW, F32V, I16Ptr, WeightMatrix, DenseMatrix, QuantMatrix
 from max.algorithm import parallelize
-from kernels import linear, head, layernorm, attention, MAX_PARTS
+from kernels import (
+    linear,
+    head,
+    layernorm,
+    attention,
+    linear_team,
+    head_team,
+    MAX_PARTS,
+)
+from team import Team
+from std.runtime import parallelism_level
 from kvcache import KVCache, DenseKV, QuantKV
 from int_attention import IntAttnKV
 from gguf import GGUFFile, GGUFMatrix, BPtr, GGML_F32, type_name
@@ -218,6 +231,9 @@ struct Model[
     var scratch: FPtr  # gemv partial sums
     var prof: Pointer[Int, MutUntrackedOrigin]  # ns per [phase][P_*]; phase 0 = decode, 1 = prompt
     var prof_tokens: Pointer[Int, MutUntrackedOrigin]  # tokens per phase
+    var team: Team  # the threads that decode a token together (team.mojo)
+    var team_i16: I16Ptr  # decode's quantized / reordered activations (2 x 4C)
+    var team_f: FPtr  # their per-lane sums (4C / 16) and scale (2)
 
     def __init__(
         out self,
@@ -258,6 +274,12 @@ struct Model[
         self.kv = Self.KV.create(N_LAYER, MAX_T, N_HEAD, HS)
         self.scratch = unsafe_alloc[Float32](MAX_PARTS * 4 * C)
         self.prof = unsafe_alloc[Int](2 * P_N)
+        # One team member per physical core: with 2 hyperthreads per core, a
+        # waiting thread slows its sibling (measured: 4 threads decode ~40%
+        # faster than 8 on the 4-core/8-thread i7-1160G7; PLAN.md M6).
+        self.team = Team(max(1, parallelism_level() // 2))
+        self.team_i16 = unsafe_alloc[Int16](2 * 4 * C)
+        self.team_f = unsafe_alloc[Float32](4 * C // 16 + 2)
         self.prof_tokens = unsafe_alloc[Int](2)
         for i in range(2 * P_N):
             self.prof[unsafe_offset=i] = 0
@@ -281,6 +303,9 @@ struct Model[
         self.kv.free()
         self.scratch.unsafe_free()
         self.prof.unsafe_free()
+        self.team.free()
+        self.team_i16.unsafe_free()
+        self.team_f.unsafe_free()
         self.prof_tokens.unsafe_free()
 
     def weight_bytes(self) -> Int:
@@ -302,8 +327,10 @@ struct Model[
 
     def forward(self, tokens: List[Int], pos0: Int) -> FPtr:
         """Runs tokens at positions pos0.. and returns the last token's logits.
-        """
-        var ph = 0 if len(tokens) == 1 else 1
+        One token (decoding) goes through `decode`, as one parallel region."""
+        if len(tokens) == 1:
+            return self.decode(tokens[0], pos0)
+        var ph = 1
         self.blocks(tokens, pos0)
         var t = perf_counter_ns()
         var last = self.x.unsafe_offset((len(tokens) - 1) * C)
@@ -311,6 +338,111 @@ struct Model[
         t = self.tick(P_LN, ph, t)
         head(self.logits, self.xn, self.lm, 1, V, C)
         _ = self.tick(P_HEAD, ph, t)
+        return self.logits
+
+    def set_threads(mut self, n: Int):
+        """Uses a team of n threads for decoding (default: the runtime's
+        parallelism level)."""
+        self.team.free()
+        self.team = Team(n)
+
+    def decode(self, token: Int, pos: Int) -> FPtr:
+        """One token at position pos through the whole model; returns its
+        logits.
+
+        The whole step is one parallel region: a team of threads goes
+        through every operation together (linear_team, attend_one per head,
+        head_team), meeting at a spin barrier after each, instead of starting
+        a parallel region per operation (~50 per token, ~23-80 us each;
+        PLAN.md M6). Thread 0 does the small serial pieces (embedding,
+        LayerNorm, storing the token's key and value) and the profiling.
+        The arithmetic is the same as the region-per-operation path.
+        """
+        self.prof_tokens[unsafe_offset=0] += 1
+        var team = self.team
+        var nt = team.nt
+        var x = self.x
+        var xn = self.xn
+        var qkv = self.qkv
+        var att = self.att
+        var fc = self.fc
+        var scratch = self.scratch
+        var xq = self.team_i16
+        var xp = self.team_i16.unsafe_offset(4 * C)
+        var xs = self.team_f
+        var sx = self.team_f.unsafe_offset(4 * C // 16)
+
+        def worker(tid: Int) {imm}:
+            var tm = perf_counter_ns()
+            if tid == 0:
+                var p = self.wpe.unsafe_offset(pos * C)
+                self.wte.dequant_row(token, x)
+                for i in range(0, C, NW):
+                    x.unsafe_store(
+                        i, x.unsafe_load[width=NW](i) + p.unsafe_load[width=NW](i)
+                    )
+                tm = self.tick(P_EMBED, 0, tm)
+            for l in range(N_LAYER):
+                var m = self.mats.unsafe_ptr().unsafe_offset(l * N_MATS)
+                var v = self.vecs.unsafe_ptr().unsafe_offset(l * N_VECS)
+                if tid == 0:
+                    layernorm[C](
+                        xn, x, v[unsafe_offset=LN1_W], v[unsafe_offset=LN1_B], 1
+                    )
+                team.wait()
+                if tid == 0:
+                    tm = self.tick(P_LN, 0, tm)
+                linear_team(
+                    tid, team, qkv, xn, m[unsafe_offset=QKV],
+                    v[unsafe_offset=QKV_B], C, 3 * C, scratch, xq, xp, xs, sx,
+                )
+                if tid == 0:
+                    tm = self.tick(P_QKV, 0, tm)
+                    self.kv.store(
+                        l, pos, qkv.unsafe_offset(C), qkv.unsafe_offset(2 * C)
+                    )
+                team.wait()
+                if tid == 0:
+                    tm = self.tick(P_KVSTORE, 0, tm)
+                for h in range(tid, N_HEAD, nt):
+                    self.kv.attend_one[N_HEAD, HS](att, qkv, l, 0, h, pos)
+                team.wait()
+                if tid == 0:
+                    tm = self.tick(P_ATTN, 0, tm)
+                linear_team[RESID=True](
+                    tid, team, x, att, m[unsafe_offset=PROJ],
+                    v[unsafe_offset=PROJ_B], C, C, scratch, xq, xp, xs, sx,
+                )
+                if tid == 0:
+                    tm = self.tick(P_PROJ, 0, tm)
+                    layernorm[C](
+                        xn, x, v[unsafe_offset=LN2_W], v[unsafe_offset=LN2_B], 1
+                    )
+                team.wait()
+                if tid == 0:
+                    tm = self.tick(P_LN, 0, tm)
+                linear_team[GELU=True](
+                    tid, team, fc, xn, m[unsafe_offset=FC],
+                    v[unsafe_offset=FC_B], C, 4 * C, scratch, xq, xp, xs, sx,
+                )
+                if tid == 0:
+                    tm = self.tick(P_FC, 0, tm)
+                linear_team[RESID=True](
+                    tid, team, x, fc, m[unsafe_offset=FCPROJ],
+                    v[unsafe_offset=FCPROJ_B], 4 * C, C, scratch, xq, xp, xs, sx,
+                )
+                if tid == 0:
+                    tm = self.tick(P_FCPROJ, 0, tm)
+            if tid == 0:
+                layernorm[C](xn, x, self.lnf_w, self.lnf_b, 1)
+            team.wait()
+            if tid == 0:
+                tm = self.tick(P_LN, 0, tm)
+            head_team(tid, team, self.logits, xn, self.lm, V, C, xq, xp, xs, sx)
+            if tid == 0:
+                _ = self.tick(P_HEAD, 0, tm)
+
+        parallelize(worker, nt)
         return self.logits
 
     def forward_all(self, tokens: List[Int], logits: FPtr):
@@ -633,6 +765,7 @@ struct Args(Movable):
     var kv: String  # KV cache format, or "auto" for the weights' default
     var attention: String  # "float", or "int" (integer attention, int8 cache)
     var profile: Bool  # print time per operation at the end
+    var threads: Int  # decode team size; 0 = the runtime's parallelism level
 
     def __init__(out self) raises:
         self.dtype = "f32"
@@ -650,6 +783,7 @@ struct Args(Movable):
         self.kv = "auto"
         self.attention = "float"
         self.profile = False
+        self.threads = 0
         var args = argv()
         var a = 1
         while a < len(args):
@@ -674,6 +808,8 @@ struct Args(Movable):
                     self.kv = val
                 elif arg == "--attention":
                     self.attention = val
+                elif arg == "--threads":
+                    self.threads = atol(val)
                 elif arg == "-m":
                     self.dir = val
                 elif arg == "-n":
@@ -698,6 +834,10 @@ def generate[
     """Loads the model with weights in format W and generates text."""
     var t_load = perf_counter_ns()
     var model = load[W, E, KV](args)
+    if args.threads > 0:
+        # A barrier needs every team member running at once, so no more
+        # than the runtime's worker threads.
+        model.set_threads(min(args.threads, parallelism_level()))
     var tok = Tokenizer(args.dir)
     var load_ms = Float64(perf_counter_ns() - t_load) / 1e6
 
@@ -949,6 +1089,10 @@ def evaluate[
     if len(ids) < 2:
         raise Error("need at least 2 tokens in " + args.ppl)
     var model = load[W, E, KV](args)
+    if args.threads > 0:
+        # A barrier needs every team member running at once, so no more
+        # than the runtime's worker threads.
+        model.set_threads(min(args.threads, parallelism_level()))
     var fmt = model_name[W, E, KV]()
     if args.compare:
         # The reference: float32 weights and a float32 KV cache.
