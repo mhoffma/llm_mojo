@@ -7,9 +7,10 @@ are exact, so the kernels should agree to float32 rounding (~1e-6 relative).
 
 Covers the one-token path (dot_row_i16), the tile path (tile_i16, for T > 1),
 the leftover rows when OUT isn't a multiple of 32 (rows_i16), token counts
-that aren't a multiple of the 4-token tile, and inputs that would overflow
-int32 without the tile path's flushing (large activations, int8 weights,
-3072-wide groups).
+that aren't a multiple of the 4-token tile, the group-per-lane decode layout
+of int4-g32 A16 formats (QuantMatrix.BLOCKED), and inputs that would
+overflow int32 without the tile path's flushing (large activations, int8
+weights, 3072-wide groups).
 
     uv run mojo run -I . tests/a16_kernels.mojo
 """
@@ -84,6 +85,9 @@ def main():
     for T in [1, 3, 4, 9]:
         worst = max(worst, check[QuantMatrix[4, 32, False, True]]("int4-g32", T, 768, 64, False))
         worst = max(worst, check[QuantMatrix[4, 32, False, True]]("int4-g32", T, 768, 70, False))
+    for T in [1, 5]:  # the group-per-lane decode layout (BLOCKED)
+        worst = max(worst, check[QuantMatrix[4, 32, True, True]]("int4-g32-sym", T, 3072, 64, False))
+        worst = max(worst, check[QuantMatrix[4, 32, False, True]]("int4-g32", T, 3072, 40, True))
     for T in [1, 6]:
         worst = max(worst, check[QuantMatrix[8, 0, False, True]]("int8-ch", T, 768, 64, False))
         worst = max(worst, check[QuantMatrix[8, 0, False, True]]("int8-ch", T, 3072, 64, True))

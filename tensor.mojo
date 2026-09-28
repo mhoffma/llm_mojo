@@ -12,6 +12,7 @@ virtual-call cost in the inner loops: `load` on a float32 matrix compiles to
 exactly the plain SIMD load the untyped gpt2.mojo does.
 """
 
+from std.memory import bitcast
 from std.memory.alloc import unsafe_alloc
 from std.sys.info import CompilationTarget
 from std.sys.intrinsics import llvm_intrinsic
@@ -96,10 +97,18 @@ trait WeightMatrix(Deinitable, ImplicitlyCopyable):
         """Returns the dot product of row `row` with x[cols]."""
         ...
 
-    def dot_row_i16(self, row: Int, xq: I16Ptr) -> Float32:
+    def permute_x_i16(self, xq: I16Ptr, n: Int, dst: I16Ptr, sums: FPtr) -> Bool:
+        """For ACT16 formats whose decode layout needs it: writes the int16
+        activations xq[n] into dst in the order dot_row_i16 reads them, and
+        per-lane activation sums into sums[n / 16], once per token. Returns
+        False (and writes nothing) if the format reads xq as is."""
+        return False
+
+    def dot_row_i16(self, row: Int, xq: I16Ptr, xsums: FPtr) -> Float32:
         """For ACT16 formats: the dot product of row `row` with int16
         activations xq[cols], in the weights' float scale (the caller
-        multiplies by the activations' scale)."""
+        multiplies by the activations' scale). xq and xsums are as prepared
+        by permute_x_i16 if it returned True."""
         abort("dot_row_i16: this format has no integer kernel")
 
     def unpack_row_i16(self, row: Int, dst: I16Ptr, scales: FPtr):
@@ -236,12 +245,28 @@ struct QuantMatrix[
     a whole group in one lane, so it flushes to float every 256 inputs; see
     kernels.tile_i16.)
 
+    Decode layout for int4, 32-weight groups, A16 (BLOCKED): in the layout
+    above each group fills a whole register, so every 32 weights need their
+    own int32 -> float conversion and scale. Instead, each 256 weights (8
+    groups) are stored as 8 steps of 16 bytes, where step s's lane i (int16
+    pair i of the unpacked 32 codes) holds codes 2p and 2p+1 of group i % 8,
+    with p = 8 * (i // 8) + s: lanes 0-7 cover the first halves of the 8
+    groups and lanes 8-15 the second halves. After 8 VPDPWSSDs each lane
+    holds one half-group's sum, and zero points, conversion and scales are
+    applied once per 256 weights, as 16-lane vector operations. The zero
+    point is applied as sum(x*u) - zero_point*sum(x), with the per-lane
+    activation sums computed once per token (permute_x_i16, which also puts
+    the activations in the same order). Only int4-g32*-a16 use this layout.
+
     Rounding is plain round-to-nearest.
     """
 
     comptime OUT_MAJOR = True
     comptime FROM_GGUF = False
     comptime ACT16 = Self.A16
+    comptime BLOCKED = Self.A16 and Self.BITS == 4 and Self.GROUP == 32
+    """Group-per-lane code layout, for fast decode with 32-weight groups
+    (see the struct docstring)."""
     comptime LEVELS = (1 << Self.BITS) - 1  # largest code
     comptime HALF = 1 << (Self.BITS - 1)  # the zero point when symmetric
 
@@ -328,21 +353,51 @@ struct QuantMatrix[
                     m.set_code(r, g * group + j, clamp_code(u, Self.LEVELS))
         return m
 
+    @always_inline
+    @staticmethod
+    def nibble_at(col: Int) -> Tuple[Int, Bool]:
+        """For int4: the byte (within its row) holding column col's code,
+        and whether it is the high nibble. Unpacking 16 bytes b as
+        (b & 0xF).join(b >> 4) gives 32 codes where code j comes from byte
+        j % 16, high nibble for j >= 16."""
+        var j: Int  # position among the 32 codes unpacked together
+        var chunk: Int  # which 16 bytes
+        comptime if Self.BLOCKED:
+            var w = col % 256
+            var e = w % 32  # position in its group
+            var p = e // 2  # pair in the group
+            var lane = w // 32 + 8 * (p // 8)
+            chunk = (col // 256) * 8 + p % 8  # block, then step
+            j = 2 * lane + e % 2
+        else:
+            chunk = col // 32
+            j = col % 32
+        return (chunk * 16 + j % 16, j >= 16)
+
     def set_code(self, row: Int, col: Int, u: Int):
         var p = self.data.unsafe_offset(row * self.cols * Self.BITS // 8)
         comptime if Self.BITS == 8:
             p[unsafe_offset=col] = UInt8(u)
         else:
-            # Chunk col // 32; within it, weight j is in byte j % 16, in the
-            # low nibble for j < 16 and the high nibble otherwise.
-            var j = col % 32
-            var i = (col // 32) * 16 + j % 16
-            var b = p[unsafe_offset=i]
-            if j < 16:
-                b = (b & 0xF0) | UInt8(u)
-            else:
+            var at = Self.nibble_at(col)
+            var b = p[unsafe_offset = at[0]]
+            if at[1]:
                 b = (b & 0x0F) | UInt8(u << 4)
-            p[unsafe_offset=i] = b
+            else:
+                b = (b & 0xF0) | UInt8(u)
+            p[unsafe_offset = at[0]] = b
+
+    @always_inline
+    def code(self, row: Int, col: Int) -> Int:
+        """One code, read with nibble_at (scalar; for the BLOCKED layout's
+        slow paths)."""
+        var p = self.data.unsafe_offset(row * self.cols * Self.BITS // 8)
+        comptime if Self.BITS == 8:
+            return Int(p[unsafe_offset=col])
+        else:
+            var at = Self.nibble_at(col)
+            var b = Int(p[unsafe_offset = at[0]])
+            return b >> 4 if at[1] else b & 0xF
 
     @always_inline
     def row_op[DOT: Bool](self, row: Int, dst: FPtr, x: FPtr) -> F32x16:
@@ -351,6 +406,21 @@ struct QuantMatrix[
         var p = self.data.unsafe_offset(row * self.cols * Self.BITS // 8)
         var gpr = self.cols // self.group
         var acc = F32x16(0)
+        comptime if Self.BLOCKED:
+            # Scalar path: only the embedding lookup and tests use this
+            # layout's float methods.
+            var d = Float32(0)
+            for k in range(self.cols):
+                var g = row * gpr + k // self.group
+                var v = Float32(
+                    self.code(row, k) - Int(self.zero_point[unsafe_offset=g])
+                ) * self.scale[unsafe_offset=g].cast[DType.float32]()
+                comptime if DOT:
+                    d += v * x[unsafe_offset=k]
+                else:
+                    dst[unsafe_offset=k] = v
+            acc[0] = d
+            return acc
         for g in range(gpr):
             var s = F32x16(self.scale[unsafe_offset = row * gpr + g].cast[DType.float32]())
             var zp = F32x16(Float32(Int(self.zero_point[unsafe_offset = row * gpr + g])))
@@ -396,10 +466,49 @@ struct QuantMatrix[
             u = p.unsafe_load[width=32](k0)
         return u.cast[DType.int16]() - zp
 
-    def dot_row_i16(self, row: Int, xq: I16Ptr) -> Float32:
+    def permute_x_i16(self, xq: I16Ptr, n: Int, dst: I16Ptr, sums: FPtr) -> Bool:
+        comptime if Self.BLOCKED:
+            # Put activation k where the code of column k sits after
+            # unpacking, and sum each lane's 16 activations (exact in float:
+            # at most 16 * 32767).
+            for blk in range(n // 256):
+                for lane in range(16):
+                    sums[unsafe_offset = blk * 16 + lane] = 0
+                for w in range(256):
+                    var col = blk * 256 + w
+                    var e = w % 32
+                    var p = e // 2
+                    var lane = w // 32 + 8 * (p // 8)
+                    var v = xq[unsafe_offset=col]
+                    dst[unsafe_offset = blk * 256 + (p % 8) * 32 + 2 * lane + e % 2] = v
+                    sums[unsafe_offset = blk * 16 + lane] += Float32(Int(v))
+            return True
+        else:
+            return False
+
+    def dot_row_i16(self, row: Int, xq: I16Ptr, xsums: FPtr) -> Float32:
         var p = self.data.unsafe_offset(row * self.cols * Self.BITS // 8)
         var gpr = self.cols // self.group
         var accf = F32x16(0)
+        comptime if Self.BLOCKED:
+            for blk in range(self.cols // 256):
+                var acc = I32x16(0)
+                comptime for step in range(8):
+                    var b = p.unsafe_load[width=16](blk * 128 + step * 16)
+                    var u = (b & 0xF).join(b >> 4).cast[DType.int16]()
+                    acc = dot_pairs(
+                        acc, xq.unsafe_load[width=32](blk * 256 + step * 32), u
+                    )
+                # Lane i belongs to group i % 8: duplicate the 8 groups' zero
+                # points and scales across both halves.
+                var g0 = row * gpr + blk * 8
+                var zp8 = self.zero_point.unsafe_load[width=8](g0)
+                var sc8 = self.scale.unsafe_load[width=8](g0)
+                var zp = zp8.join(zp8).cast[DType.float32]()
+                var sc = sc8.join(sc8).cast[DType.float32]()
+                var xs = xsums.unsafe_load[width=16](blk * 16)
+                accf = (acc.cast[DType.float32]() - zp * xs).fma(sc, accf)
+            return accf.reduce_add()
         for g in range(gpr):
             var zp = I16x32(Int16(Int(self.zero_point[unsafe_offset = row * gpr + g])))
             var acc = I32x16(0)
@@ -415,6 +524,32 @@ struct QuantMatrix[
     def unpack_row_i16(self, row: Int, dst: I16Ptr, scales: FPtr):
         var p = self.data.unsafe_offset(row * self.cols * Self.BITS // 8)
         var gpr = self.cols // self.group
+        comptime if Self.BLOCKED:
+            # Unpack each step's 32 codes with SIMD, subtract the lanes' zero
+            # points, then store each lane's pair of codes (one int32) at its
+            # place in natural order: lane L of step s holds codes 2p, 2p+1
+            # of group L % 8, with p = 8 * (L // 8) + s.
+            for g in range(gpr):
+                scales[unsafe_offset=g] = self.scale[
+                    unsafe_offset = row * gpr + g
+                ].cast[DType.float32]()
+            var dst32 = dst.unsafe_bitcast[Int32]()
+            for blk in range(self.cols // 256):
+                var zp8 = self.zero_point.unsafe_load[width=8](row * gpr + blk * 8)
+                var zp32 = zp8.join(zp8).cast[DType.int32]()
+                var zp = bitcast[DType.int16, 32](zp32 | (zp32 << 16))
+                comptime for step in range(8):
+                    var b = p.unsafe_load[width=16](blk * 128 + step * 16)
+                    var u = (b & 0xF).join(b >> 4).cast[DType.int16]() - zp
+                    var pairs = bitcast[DType.int32, 16](u)
+                    comptime for L in range(16):
+                        dst32[
+                            unsafe_offset = blk * 128
+                            + (L % 8) * 16
+                            + (L // 8) * 8
+                            + step
+                        ] = pairs[L]
+            return
         for g in range(gpr):
             var zp = I16x32(Int16(Int(self.zero_point[unsafe_offset = row * gpr + g])))
             scales[unsafe_offset=g] = self.scale[unsafe_offset = row * gpr + g].cast[

@@ -477,16 +477,23 @@ def matmul_rows_a16[
     comptime RB = 16  # output rows per task
 
     if T == 1:
+        # Formats with their own decode layout (QuantMatrix BLOCKED) get the
+        # activations permuted to match, once per token.
+        var xp = unsafe_alloc[Int16](IN)
+        var xs = unsafe_alloc[Float32](IN // 16)
+        var x1 = xp if w.permute_x_i16(xq, IN, xp, xs) else xq
 
         def one(ti: Int) {imm}:
             var s = sx[unsafe_offset=0]
             for o in range(ti * RB, min(OUT, (ti + 1) * RB)):
-                var r = w.dot_row_i16(o, xq) * s
+                var r = w.dot_row_i16(o, x1, xs) * s
                 comptime if BIAS:
                     r += b[unsafe_offset=o]
                 finish[RESID, GELU](out_, o, r)
 
         parallelize(one, (OUT + RB - 1) // RB)
+        xp.unsafe_free()
+        xs.unsafe_free()
     else:
         var G = w.group_size()
         comptime NV = 2

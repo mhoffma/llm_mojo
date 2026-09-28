@@ -50,7 +50,7 @@ accuracy each format costs for that speed**.
 | M1. Generic weight formats, float32 bit-identical to baseline | ✅ done |
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
-| M4. int16 activations + integer VNNI kernel (W4A16) | 🔄 working and verified; integer prefill tiles done (~890 tok/s); cheaper decode for small groups next |
+| M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~147 tok/s) at +1.2% perplexity; clean prefill re-benchmark pending |
 | M5. Tuning and final results table | ☐ |
 | M6. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
@@ -416,9 +416,21 @@ Expectation to test: per-channel is fine for int8, but at int4 groups of
   Perplexity differs between integer paths by ~1e-4 relative even though
   the kernels are exact: int16 rounding of activations turns 1e-7
   differences into occasional one-step flips, which compound over layers.
-- Next: cheaper per-group scaling for small groups in decode (int4-g32-a16
-  decode gains only ~10%), e.g. accumulating int32 group sums for 16 groups
-  before converting.
+- **Group-per-lane decode layout for int4-g32 A16** (`QuantMatrix.BLOCKED`):
+  with 32-weight groups each group used to fill a register, so every 32
+  weights needed their own conversion and scale. Now every 256 weights (8
+  groups) are stored as 8 steps of 16 bytes where lane i holds half of group
+  i % 8, so after 8 VPDPWSSDs each lane has a half-group sum, and zero
+  points, conversion and scales are applied once per 256 weights. The zero
+  point is applied as sum(x*u) - zero_point*sum(x), with per-lane activation
+  sums and the matching activation order computed once per token
+  (`permute_x_i16`). Prefill unpacks this layout with SIMD plus one int32
+  store per lane pair. int4-g32-a16 decode: 95 / 78 → **147 / 114 tok/s**
+  (clean run, AC). Kernel tests pass (max error 3e-7), perplexity and greedy
+  decode unchanged. Prefill after the SIMD unpack could only be measured
+  under load (Chrome etc., load average 5-6): on par with int4-ch-a16
+  (721 vs 683; that format reached ~900 when idle). Re-benchmark on an idle
+  machine.
 
 Original plan:
 
@@ -541,7 +553,9 @@ battery with f16 (624 / 94 / 78), int4-g32 (646 / 95 / 68), int8-ch
 (622 / 115 / 94) and int4-ch (607 / 119 / 97). §With the integer prefill
 tiles: 3 rounds on AC with f16 (538 / 84 / 58), int4-g32 (679 / 85 / 68),
 int8-ch (624 / 112 / 79). int4-g128-a16's prefill was measured before the
-tiles. Speed ranges are from two interleaved
+tiles. ¶With the group-per-lane decode layout: 3 rounds on AC with int4-g32
+(595 / 88 / 74), int4-ch-a16 (920 / 130 / 102), int8-ch-a16 (905 / 138 /
+113), f16 (546 / 90 / 38). Speed ranges are from two interleaved
 rounds; the machine's speed drifts by ±15% between runs (thermal), so compare
 formats measured in the same session.
 
@@ -580,7 +594,7 @@ Notes on f16 / bf16:
 | GGUF Q4_0 (head Q6_K) | 99 MB | 710 | 80 / 79 | 27.178 (+7.49%) | 74.6% | 1.7e-1 |
 | GGUF Q4_K_M (Q4_K/Q5_K/Q6_K, head Q6_K) | 105 MB | 690 | 107 / 90 | 25.460 (+0.70%) | 80.2% | 9.8e-2 |
 | GGUF i1-Q4_K_M (NumPy only so far) | 105 MB | | | 27.615 (+9.2%) | | |
-| int4, group 32, W4A16 + int8 head (A16) | 88 MB | **885**§ | 95 / 78§ | 25.593 (+1.22%) | | |
+| **int4, group 32, W4A16 + int8 head (A16)** | 88 MB | ~885§ (re-measure) | **147 / 114**¶ | 25.593 (+1.22%) | | |
 | int8, per-channel, W8A16 | 121 MB | **899**§ | 135 / 103§ (152 / 119†) | 26.117 (+3.29%) | | |
 | int4, group 128, W4A16 | 82 MB | 469‡ | 126 / 105‡ | | | |
 | int4, per-channel, W4A16 | 81 MB | 888§ | 126 / 100§ | | | |
