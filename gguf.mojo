@@ -135,28 +135,70 @@ def f32_at(p: BPtr, i: Int) -> Float32:
 # ===----------------------------------------------------------------------=== #
 
 
-def dequant_q4_0(b: BPtr, dst: FPtr):
-    var d = f16_at(b, 0)
-    for j in range(16):
-        var q = Int(b[unsafe_offset = 2 + j])
-        dst[unsafe_offset=j] = d * Float32((q & 0xF) - 8)
-        dst[unsafe_offset = j + 16] = d * Float32((q >> 4) - 8)
+# Each dequantizer works on 16 weights at a time: it loads 16 bytes as a
+# SIMD[uint8, 16], splits nibbles or bit fields with masks and shifts (which
+# act on all 16 lanes at once), converts the codes to float32 in one step,
+# and applies the block's scale and offset. These replaced a first version
+# that did the same per weight in scalar code, which was ~10x slower.
+#
+# Each one is compiled in two variants, chosen by the DOT parameter:
+#   DOT=False: store the weights to dst (dequantize a row);
+#   DOT=True:  multiply them by x and add into acc, without storing (the
+#              dot product of a row with x, fused; used when decoding).
+# `put` is the only place the variants differ, so they can't drift apart.
+
+comptime U8x16 = SIMD[DType.uint8, 16]
+comptime F32x16 = SIMD[DType.float32, 16]
 
 
-def dequant_q4_1(b: BPtr, dst: FPtr):
-    var d = f16_at(b, 0)
-    var m = f16_at(b, 2)
-    for j in range(16):
-        var q = Int(b[unsafe_offset = 4 + j])
-        dst[unsafe_offset=j] = d * Float32(q & 0xF) + m
-        dst[unsafe_offset = j + 16] = d * Float32(q >> 4) + m
+@always_inline
+def bytes16(p: BPtr, i: Int) -> U8x16:
+    return p.unsafe_load[width=16](i)
 
 
-def dequant_q8_0(b: BPtr, dst: FPtr):
-    var d = f16_at(b, 0)
-    for j in range(32):
-        var q = Int(b[unsafe_offset = 2 + j].cast[DType.int8]())
-        dst[unsafe_offset=j] = d * Float32(q)
+@always_inline
+def codes(v: U8x16) -> F32x16:
+    """Unsigned byte codes to float32."""
+    return v.cast[DType.float32]()
+
+
+@always_inline
+def put[
+    DOT: Bool
+](dst: FPtr, x: FPtr, acc: F32x16, off: Int, v: F32x16) -> F32x16:
+    """Stores v to dst[off:], or with DOT, returns acc + v * x[off:]."""
+    comptime if DOT:
+        return v.fma(x.unsafe_load[width=16](off), acc)
+    else:
+        dst.unsafe_store(off, v)
+        return acc
+
+
+def dequant_q4_0[DOT: Bool](b: BPtr, dst: FPtr, x: FPtr, acc_in: F32x16) -> F32x16:
+    var acc = acc_in
+    var d = F32x16(f16_at(b, 0))
+    var q = bytes16(b, 2)
+    # Low nibbles are weights 0-15, high nibbles 16-31.
+    acc = put[DOT](dst, x, acc, 0, (codes(q & 0xF) - 8) * d)
+    return put[DOT](dst, x, acc, 16, (codes(q >> 4) - 8) * d)
+
+
+def dequant_q4_1[DOT: Bool](b: BPtr, dst: FPtr, x: FPtr, acc_in: F32x16) -> F32x16:
+    var acc = acc_in
+    var d = F32x16(f16_at(b, 0))
+    var m = F32x16(f16_at(b, 2))
+    var q = bytes16(b, 4)
+    acc = put[DOT](dst, x, acc, 0, d * codes(q & 0xF) + m)
+    return put[DOT](dst, x, acc, 16, d * codes(q >> 4) + m)
+
+
+def dequant_q8_0[DOT: Bool](b: BPtr, dst: FPtr, x: FPtr, acc_in: F32x16) -> F32x16:
+    var acc = acc_in
+    var d = F32x16(f16_at(b, 0))
+    comptime for h in range(2):
+        var q = bitcast[DType.int8, 16](bytes16(b, 2 + 16 * h))
+        acc = put[DOT](dst, x, acc, 16 * h, d * q.cast[DType.float32]())
+    return acc
 
 
 @always_inline
@@ -178,99 +220,80 @@ def k_scale_min(q: BPtr, j: Int) -> Tuple[Int, Int]:
     return (sc, m)
 
 
-def dequant_q4_k(b: BPtr, dst: FPtr):
+def dequant_q4_k[DOT: Bool](b: BPtr, dst: FPtr, x: FPtr, acc_in: F32x16) -> F32x16:
+    var acc = acc_in
     var d = f16_at(b, 0)
     var dmin = f16_at(b, 2)
     var scales = b.unsafe_offset(4)
-    var q = b.unsafe_offset(16)
-    var y = 0
-    var sub = 0
-    for _ in range(4):  # 4 x 64 weights; each byte holds two sub-blocks
-        var sm1 = k_scale_min(scales, sub)
-        var sm2 = k_scale_min(scales, sub + 1)
-        var d1 = d * Float32(sm1[0])
-        var m1 = dmin * Float32(sm1[1])
-        var d2 = d * Float32(sm2[0])
-        var m2 = dmin * Float32(sm2[1])
-        for l in range(32):
-            dst[unsafe_offset = y + l] = d1 * Float32(
-                Int(q[unsafe_offset=l]) & 0xF
-            ) - m1
-        for l in range(32):
-            dst[unsafe_offset = y + 32 + l] = d2 * Float32(
-                Int(q[unsafe_offset=l]) >> 4
-            ) - m2
-        q = q.unsafe_offset(32)
-        y += 64
-        sub += 2
+    # 4 chunks of 64 weights. Chunk j's 32 bytes hold sub-block 2j in their
+    # low nibbles and sub-block 2j+1 in their high nibbles.
+    comptime for j in range(4):
+        var sm1 = k_scale_min(scales, 2 * j)
+        var sm2 = k_scale_min(scales, 2 * j + 1)
+        var d1 = F32x16(d * Float32(sm1[0]))
+        var m1 = F32x16(dmin * Float32(sm1[1]))
+        var d2 = F32x16(d * Float32(sm2[0]))
+        var m2 = F32x16(dmin * Float32(sm2[1]))
+        comptime for h in range(2):
+            var q = bytes16(b, 16 + 32 * j + 16 * h)
+            acc = put[DOT](dst, x, acc, 64 * j + 16 * h, d1 * codes(q & 0xF) - m1)
+            acc = put[DOT](
+                dst, x, acc, 64 * j + 32 + 16 * h, d2 * codes(q >> 4) - m2
+            )
+    return acc
 
 
-def dequant_q5_k(b: BPtr, dst: FPtr):
+def dequant_q5_k[DOT: Bool](b: BPtr, dst: FPtr, x: FPtr, acc_in: F32x16) -> F32x16:
+    var acc = acc_in
     var d = f16_at(b, 0)
     var dmin = f16_at(b, 2)
     var scales = b.unsafe_offset(4)
-    var qh = b.unsafe_offset(16)
-    var ql = b.unsafe_offset(48)
-    var y = 0
-    var sub = 0
-    var u1 = 1
-    var u2 = 2
-    for _ in range(4):
-        var sm1 = k_scale_min(scales, sub)
-        var sm2 = k_scale_min(scales, sub + 1)
-        var d1 = d * Float32(sm1[0])
-        var m1 = dmin * Float32(sm1[1])
-        var d2 = d * Float32(sm2[0])
-        var m2 = dmin * Float32(sm2[1])
-        for l in range(32):
-            var h = 16 if (Int(qh[unsafe_offset=l]) & u1) != 0 else 0
-            dst[unsafe_offset = y + l] = d1 * Float32(
-                (Int(ql[unsafe_offset=l]) & 0xF) + h
-            ) - m1
-        for l in range(32):
-            var h = 16 if (Int(qh[unsafe_offset=l]) & u2) != 0 else 0
-            dst[unsafe_offset = y + 32 + l] = d2 * Float32(
-                (Int(ql[unsafe_offset=l]) >> 4) + h
-            ) - m2
-        ql = ql.unsafe_offset(32)
-        y += 64
-        sub += 2
-        u1 <<= 2
-        u2 <<= 2
+    # Like Q4_K, plus a 5th bit per weight: bit 2j of qh[l] for the low-nibble
+    # weight l of chunk j, bit 2j+1 for the high-nibble one.
+    comptime for j in range(4):
+        var sm1 = k_scale_min(scales, 2 * j)
+        var sm2 = k_scale_min(scales, 2 * j + 1)
+        var d1 = F32x16(d * Float32(sm1[0]))
+        var m1 = F32x16(dmin * Float32(sm1[1]))
+        var d2 = F32x16(d * Float32(sm2[0]))
+        var m2 = F32x16(dmin * Float32(sm2[1]))
+        comptime for h in range(2):
+            var qh = bytes16(b, 16 + 16 * h)
+            var q = bytes16(b, 48 + 32 * j + 16 * h)
+            var lo = (q & 0xF) | (((qh >> U8x16(2 * j)) & 1) << 4)
+            var hi = (q >> 4) | (((qh >> U8x16(2 * j + 1)) & 1) << 4)
+            acc = put[DOT](dst, x, acc, 64 * j + 16 * h, d1 * codes(lo) - m1)
+            acc = put[DOT](dst, x, acc, 64 * j + 32 + 16 * h, d2 * codes(hi) - m2)
+    return acc
 
 
-def dequant_q6_k(b: BPtr, dst: FPtr):
-    var ql = b
-    var qh = b.unsafe_offset(128)
-    var sc = b.unsafe_offset(192)
+def dequant_q6_k[DOT: Bool](b: BPtr, dst: FPtr, x: FPtr, acc_in: F32x16) -> F32x16:
+    var acc = acc_in
     var d = f16_at(b, 208)
-    var y = 0
-    for _ in range(2):  # 2 x 128 weights
-        for l in range(32):
-            var s = l // 16
-            var lo0 = Int(ql[unsafe_offset=l])
-            var lo1 = Int(ql[unsafe_offset = l + 32])
-            var hi = Int(qh[unsafe_offset=l])
-            var q1 = ((lo0 & 0xF) | ((hi & 3) << 4)) - 32
-            var q2 = ((lo1 & 0xF) | (((hi >> 2) & 3) << 4)) - 32
-            var q3 = ((lo0 >> 4) | (((hi >> 4) & 3) << 4)) - 32
-            var q4 = ((lo1 >> 4) | (((hi >> 6) & 3) << 4)) - 32
-            dst[unsafe_offset = y + l] = d * Float32(
-                Int(sc[unsafe_offset=s].cast[DType.int8]()) * q1
-            )
-            dst[unsafe_offset = y + l + 32] = d * Float32(
-                Int(sc[unsafe_offset = s + 2].cast[DType.int8]()) * q2
-            )
-            dst[unsafe_offset = y + l + 64] = d * Float32(
-                Int(sc[unsafe_offset = s + 4].cast[DType.int8]()) * q3
-            )
-            dst[unsafe_offset = y + l + 96] = d * Float32(
-                Int(sc[unsafe_offset = s + 6].cast[DType.int8]()) * q4
-            )
-        ql = ql.unsafe_offset(64)
-        qh = qh.unsafe_offset(32)
-        sc = sc.unsafe_offset(8)
-        y += 128
+    # 2 halves of 128 weights. In half n, byte l of ql (64 bytes) and qh (32
+    # bytes) supply weights l, l+32, l+64, l+96: low 4 bits from a nibble of
+    # ql, high 2 bits from a pair of bits in qh. Each 16 weights share one
+    # int8 scale.
+    comptime for n in range(2):
+        var ql = 64 * n
+        var qhoff = 128 + 32 * n
+        var sc = 192 + 8 * n
+        comptime for h in range(2):
+            var lo0 = bytes16(b, ql + 16 * h)
+            var lo1 = bytes16(b, ql + 32 + 16 * h)
+            var hi = bytes16(b, qhoff + 16 * h)
+            var q1 = (lo0 & 0xF) | ((hi & 3) << 4)
+            var q2 = (lo1 & 0xF) | (((hi >> 2) & 3) << 4)
+            var q3 = (lo0 >> 4) | (((hi >> 4) & 3) << 4)
+            var q4 = (lo1 >> 4) | (((hi >> 6) & 3) << 4)
+            var base = 128 * n + 16 * h
+            comptime for k in range(4):
+                var s = Float32(Int(b[unsafe_offset = sc + h + 2 * k].cast[DType.int8]()))
+                var qk = q1 if k == 0 else (q2 if k == 1 else (q3 if k == 2 else q4))
+                acc = put[DOT](
+                    dst, x, acc, base + 32 * k, F32x16(d * s) * (codes(qk) - 32)
+                )
+    return acc
 
 
 # ===----------------------------------------------------------------------=== #
@@ -314,33 +337,59 @@ struct GGUFMatrix(WeightMatrix):
         abort("GGUFMatrix is loaded from a .gguf file, not converted")
 
     def dequant_row(self, row: Int, dst: FPtr):
+        _ = self.each_block[False](row, dst, dst)
+
+    def dot_row(self, row: Int, x: FPtr) -> Float32:
+        """Dot product of row `row` with x[cols], dequantizing on the fly."""
+        return self.each_block[True](row, x, x).reduce_add()
+
+    @always_inline
+    def each_block[DOT: Bool](self, row: Int, dst: FPtr, x: FPtr) -> F32x16:
+        """Runs the row's format's dequantizer over each of its blocks."""
         var p = self.data.unsafe_offset(row * self.row_bytes)
         var k = self.kind
-        if k == GGML_F32:
-            for i in range(self.cols):
-                dst[unsafe_offset=i] = f32_at(p, 4 * i)
-            return
-        if k == GGML_F16:
-            for i in range(self.cols):
-                dst[unsafe_offset=i] = f16_at(p, 2 * i)
-            return
-        var bs = block_size(k)
-        var bb = block_bytes(k)
-        for blk in range(self.cols // bs):
-            var src = p.unsafe_offset(blk * bb)
-            var out = dst.unsafe_offset(blk * bs)
-            if k == GGML_Q4_0:
-                dequant_q4_0(src, out)
-            elif k == GGML_Q4_1:
-                dequant_q4_1(src, out)
-            elif k == GGML_Q8_0:
-                dequant_q8_0(src, out)
-            elif k == GGML_Q4_K:
-                dequant_q4_k(src, out)
-            elif k == GGML_Q5_K:
-                dequant_q5_k(src, out)
+        # One branch per row, then a tight loop over the row's blocks.
+        if k == GGML_Q4_0:
+            return self.blocks[dequant_q4_0[DOT]](p, dst, x)
+        if k == GGML_Q4_1:
+            return self.blocks[dequant_q4_1[DOT]](p, dst, x)
+        if k == GGML_Q8_0:
+            return self.blocks[dequant_q8_0[DOT]](p, dst, x)
+        if k == GGML_Q4_K:
+            return self.blocks[dequant_q4_k[DOT]](p, dst, x)
+        if k == GGML_Q5_K:
+            return self.blocks[dequant_q5_k[DOT]](p, dst, x)
+        if k == GGML_Q6_K:
+            return self.blocks[dequant_q6_k[DOT]](p, dst, x)
+        # F32 and F16: plain loops.
+        var acc = F32x16(0)
+        for i in range(0, self.cols, 16):
+            var v: F32x16
+            if k == GGML_F32:
+                v = p.unsafe_bitcast[Float32]().unsafe_load[width=16, alignment=1](i)
             else:
-                dequant_q6_k(src, out)
+                v = p.unsafe_bitcast[Float16]().unsafe_load[width=16, alignment=1](
+                    i
+                ).cast[DType.float32]()
+            acc = put[DOT](dst, x, acc, i, v)
+        return acc
+
+    @always_inline
+    def blocks[
+        f: def(BPtr, FPtr, FPtr, F32x16) thin -> F32x16
+    ](self, p: BPtr, dst: FPtr, x: FPtr) -> F32x16:
+        """Runs f on every block of the row starting at p."""
+        var bs = block_size(self.kind)
+        var bb = block_bytes(self.kind)
+        var acc = F32x16(0)
+        for blk in range(self.cols // bs):
+            acc = f(
+                p.unsafe_offset(blk * bb),
+                dst.unsafe_offset(blk * bs),
+                x.unsafe_offset(blk * bs),
+                acc,
+            )
+        return acc
 
     def load[width: Int](self, row: Int, col: Int) -> SIMD[DType.float32, width]:
         """Slow path, for completeness: dequantizes the whole row. The

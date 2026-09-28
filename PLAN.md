@@ -49,7 +49,7 @@ accuracy each format costs for that speed**.
 | Probes: VNNI, float16/bfloat16 | ✅ done (`research/`) |
 | M1. Generic weight formats, float32 bit-identical to baseline | ✅ done |
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
-| M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | 🔄 f16/bf16, own int8/int4, GGUF loading done (accuracy verified); fast GGUF kernels next |
+| M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | 🔄 f16/bf16, own int8/int4, GGUF with fast kernels done; our int4 with a higher-precision head next |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ☐ |
 | M5. Tuning and final results table | ☐ |
 | M6. Stretch: pre-quantized weight files, int8 activations | ☐ |
@@ -166,6 +166,7 @@ users can install Modular's Mojo extension.
 
 | Check | Command | Passes when |
 |---|---|---|
+| Speed (not a pass/fail check) | `tests/bench.sh 3 f32 f16 gpt2/gguf/gpt2.Q4_K_M.gguf` | compare medians within one run |
 | Generic float32 is bit-identical to the baseline | `tests/same_as_baseline.sh` | all lines `SAME` |
 | Logits match an independent NumPy GPT-2 | `uv run python tests/reference.py logits 15496,11,616,1438,318` vs `./gpt2t_bin -v -n 0 "Hello, my name is"` | top-5 agree to ~1e-5 |
 | Greedy decoding (KV cache path) matches NumPy | `uv run --with tiktoken python tests/reference.py greedy <ids> 30` vs `./gpt2t_bin -t 0 -n 30 "<prompt>"` | identical text |
@@ -300,9 +301,22 @@ in a sweep.
   then dot it with every token). The format is chosen per tensor at runtime
   because Q4_K_M mixes Q4_K, Q5_K and Q6_K. Dequantization and perplexity
   match llama.cpp's Python package and NumPy. **Q4_K_M: perplexity +0.7%.**
-- GGUF speed is not optimized yet: rows are dequantized one scalar at a time,
-  on every token, so decode runs at ~8–20 tok/s. Next: SIMD dequantization
-  fused with the dot product, per block format, so decode can beat f16.
+- GGUF kernels (gguf.mojo, kernels.matmul_rows):
+  - Dequantizers are SIMD, 16 weights per step (masks and shifts on byte
+    vectors, one conversion to float32). Each is compiled in two variants,
+    store-to-buffer and fused-dot, differing only in `put`.
+  - Decode (one token): the dot product is computed while dequantizing
+    (`dot_row`), never writing the float32 weights. 1.3–2.5× faster per
+    weight than dequantize-then-dot (research/test_dequant.mojo).
+  - Prefill: 32 output rows at a time are dequantized into a float32 tile
+    transposed to `[IN, 32]`, and the float32 tile kernel `mm_tile` runs over
+    all tokens, so each weight is dequantized once per prompt.
+  - Result: Q4_K_M decodes faster than f16 (107 vs 88 tok/s) and reads
+    prompts faster than f32 (690 vs 559 tok/s). Decode is still arithmetic-
+    bound (Q8_0 at 167 MB is slower than Q4_K_M at 105 MB); the output head
+    (Q6_K, 38.6M weights per token) is the biggest single cost.
+- Benchmarks: `tests/bench.sh [ROUNDS] FORMAT...` interleaves formats and
+  prints medians.
 
 **Original plan for our own formats (kept for reference):**
 
@@ -433,7 +447,9 @@ On the i7-1160G7, AC power, `MODULAR_THREAD_BUSY_WAIT_US=0`. Prefill: 476-token
 prompt. Decode: 200 tokens after a short prompt / after the 476-token prompt.
 
 Perplexity, top-1 agreement, and KL are on `tests/data/alice_ch1.txt` (see
-[Accuracy harness](#accuracy-harness)). Speed ranges are from two interleaved
+[Accuracy harness](#accuracy-harness)). GGUF speeds are medians of 3 rounds
+of `tests/bench.sh`, measured together with f32 (559 / 60 / 45) and f16
+(562 / 88 / 73) in the same session. Speed ranges are from two interleaved
 rounds; the machine's speed drifts by ±15% between runs (thermal), so compare
 formats measured in the same session.
 
@@ -462,9 +478,9 @@ Notes on f16 / bf16:
 | int4, group 128 (ours, head int4) | | | | | | |
 | int4, group 64 (ours, head int4) | | | | | | |
 | int4, group 32 (ours, head int4) | 77 MB | | | 258.7 (+923%) | 25.5% | 2.4 |
-| GGUF Q8_0 (head Q6_K) | 167 MB | unoptimized | unoptimized | 25.416 (+0.52%) | 91.1% | 1.2e-2 |
-| GGUF Q4_0 (head Q6_K) | 99 MB | unoptimized | unoptimized | 27.178 (+7.49%) | 74.6% | 1.7e-1 |
-| GGUF Q4_K_M (Q4_K/Q5_K/Q6_K, head Q6_K) | 105 MB | unoptimized | unoptimized | 25.460 (+0.70%) | 80.2% | 9.8e-2 |
+| GGUF Q8_0 (head Q6_K) | 167 MB | 574 | 63 / 56 | 25.416 (+0.52%) | 91.1% | 1.2e-2 |
+| GGUF Q4_0 (head Q6_K) | 99 MB | 710 | 80 / 79 | 27.178 (+7.49%) | 74.6% | 1.7e-1 |
+| GGUF Q4_K_M (Q4_K/Q5_K/Q6_K, head Q6_K) | 105 MB | 690 | 107 / 90 | 25.460 (+0.70%) | 80.2% | 9.8e-2 |
 | GGUF i1-Q4_K_M (NumPy only so far) | 105 MB | | | 27.615 (+9.2%) | | |
 | W4A16 (best int4 config) | | | | | | |
 

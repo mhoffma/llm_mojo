@@ -12,6 +12,7 @@ Run any of them from `~/fun` with:
 |---|---|---|
 | `test_vnni.mojo` | Can Mojo 1.1 use AVX-512 VNNI (int16 × int16 → int32) and how fast is it? | Yes, via `llvm_intrinsic["llvm.x86.avx512.vpdpwssd.512"]` with `<32 x i16>` operands. ~2.6× the multiply-adds of f32 FMA. |
 | `test_half.mojo` | Does this CPU support float16/bfloat16, and what do 16-bit weights cost and save? | Storage only (F16C conversion, no 16-bit math). Widening costs ~11% when compute-bound; streaming weights from DRAM is ~1.85× faster. float16 is 8× more precise than bfloat16 for GPT-2-sized weights. |
+| `test_dequant.mojo` | How fast does `gguf.mojo` dequantize each GGUF block format, and does fusing the dot product help? | 8–19 G weights/s per thread dequantizing to a buffer; reading it back for the dot halves that; fusing the dot into the dequantizer is 1.3–2.5× faster than dequantize-then-dot. |
 
 Mojo concepts shown along the way:
 
@@ -21,3 +22,5 @@ Mojo concepts shown along the way:
 - `test_half.mojo`: float16/bfloat16 dtypes, `.cast` vs `bitcast`, generic
   functions over `DType`, `comptime if`, and a multi-threaded streaming
   benchmark with `parallelize`.
+- `test_dequant.mojo`: importing project modules (`-I .`), timing kernels
+  on real GGUF tensors, returning tuples.

@@ -62,6 +62,10 @@ trait WeightMatrix(Deinitable, ImplicitlyCopyable):
         """Writes row `row` (all `cols` values) to dst as float32."""
         ...
 
+    def dot_row(self, row: Int, x: FPtr) -> Float32:
+        """Returns the dot product of row `row` with x[cols]."""
+        ...
+
     def nbytes(self) -> Int:
         """Bytes of storage, to report the model's size."""
         ...
@@ -124,6 +128,12 @@ struct DenseMatrix[dtype: DType](WeightMatrix):
     def dequant_row(self, row: Int, dst: FPtr):
         for i in range(0, self.cols, NW):
             dst.unsafe_store(i, self.load[NW](row, i))
+
+    def dot_row(self, row: Int, x: FPtr) -> Float32:
+        var d = F32V(0)
+        for i in range(0, self.cols, NW):
+            d = self.load[NW](row, i).fma(x.unsafe_load[width=NW](i), d)
+        return d.reduce_add()
 
     def nbytes(self) -> Int:
         return self.rows * self.cols * size_of[Scalar[Self.dtype]]()
@@ -289,6 +299,12 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
     def dequant_row(self, row: Int, dst: FPtr):
         for i in range(0, self.cols, NW):
             dst.unsafe_store(i, self.load[NW](row, i))
+
+    def dot_row(self, row: Int, x: FPtr) -> Float32:
+        var d = F32V(0)
+        for i in range(0, self.cols, NW):
+            d = self.load[NW](row, i).fma(x.unsafe_load[width=NW](i), d)
+        return d.reduce_add()
 
     def nbytes(self) -> Int:
         var ngroups = self.rows * self.cols // self.group

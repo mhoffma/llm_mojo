@@ -15,7 +15,7 @@ from std.memory.alloc import unsafe_alloc
 from std.runtime import parallelism_level
 from max.algorithm import parallelize
 
-from tensor import FPtr, NW, F32V, WeightMatrix
+from tensor import FPtr, NW, F32V, WeightMatrix, DenseMatrix
 
 comptime MAX_PARTS = 64
 """Most threads gemv splits a matrix across; sizes its scratch buffer."""
@@ -34,7 +34,12 @@ def store_out[RESID: Bool, GELU: Bool](o: FPtr, off: Int, var r: F32V):
 
 @always_inline
 def mm_tile[
-    W: WeightMatrix, TM: Int, NV: Int, RESID: Bool, GELU: Bool
+    W: WeightMatrix,
+    TM: Int,
+    NV: Int,
+    RESID: Bool,
+    GELU: Bool,
+    BIAS: Bool = True,
 ](
     out_: FPtr,
     x: FPtr,
@@ -58,7 +63,9 @@ def mm_tile[
     comptime for m in range(TM):
         var orow = out_.unsafe_offset((t0 + m) * OUT + j0)
         comptime for v in range(NV):
-            var r = acc[m * NV + v] + b.unsafe_load[width=NW](j0 + v * NW)
+            var r = acc[m * NV + v]
+            comptime if BIAS:
+                r += b.unsafe_load[width=NW](j0 + v * NW)
             store_out[RESID, GELU](orow, v * NW, r)
 
 
@@ -303,48 +310,113 @@ def matmul_rows[
     """Computes out[T, OUT] (+)= act(x[T, IN] @ w[OUT, IN]^T + b[OUT]).
 
     For weights stored one output per row (W.OUT_MAJOR), as GGUF files store
-    them. Threads split the output rows. Each row is dequantized once into a
-    float32 buffer, then dotted with 4 rows of x at a time, so the cost of
-    dequantizing is shared by all T tokens.
-    """
-    comptime RB = 16  # output rows per task
-    var ntasks = (OUT + RB - 1) // RB
+    them. Two strategies:
 
-    def task(ti: Int) {imm}:
+    - One token (decode): threads split the output rows, and each row's dot
+      product with x is computed while dequantizing (w.dot_row), without
+      writing the float32 weights anywhere.
+    - Several tokens (prefill): threads take 32 output rows at a time,
+      dequantize them into a float32 tile transposed to [IN, 32], and run the
+      float32 tile kernel (mm_tile) over all T tokens. Dequantizing is done
+      once per weight and shared by every token.
+    """
+    if T == 1:
+        comptime RB = 16  # output rows per task
+
+        def one(ti: Int) {imm}:
+            for o in range(ti * RB, min(OUT, (ti + 1) * RB)):
+                var r = w.dot_row(o, x)
+                comptime if BIAS:
+                    r += b[unsafe_offset=o]
+                finish[RESID, GELU](out_, o, r)
+
+        parallelize(one, (OUT + RB - 1) // RB)
+        return
+
+    comptime NV = 2
+    comptime TN = NV * NW  # output rows per tile
+    comptime TM = 8
+    var full = OUT // TN
+    var ntasks = full + (1 if OUT % TN != 0 else 0)
+
+    def tile_task(ti: Int) {imm}:
         var row = unsafe_alloc[Float32](IN)
-        for o in range(ti * RB, min(OUT, (ti + 1) * RB)):
-            w.dequant_row(o, row)
-            var bias = Float32(0)
-            comptime if BIAS:
-                bias = b[unsafe_offset=o]
-            var t = 0
-            while t + 4 <= T:
-                var d0 = F32V(0)
-                var d1 = F32V(0)
-                var d2 = F32V(0)
-                var d3 = F32V(0)
-                var x0 = x.unsafe_offset(t * IN)
-                for i in range(0, IN, NW):
-                    var wv = row.unsafe_load[width=NW](i)
-                    d0 = x0.unsafe_load[width=NW](i).fma(wv, d0)
-                    d1 = x0.unsafe_load[width=NW](IN + i).fma(wv, d1)
-                    d2 = x0.unsafe_load[width=NW](2 * IN + i).fma(wv, d2)
-                    d3 = x0.unsafe_load[width=NW](3 * IN + i).fma(wv, d3)
-                finish[RESID, GELU](out_, t * OUT + o, d0.reduce_add() + bias)
-                finish[RESID, GELU](out_, (t + 1) * OUT + o, d1.reduce_add() + bias)
-                finish[RESID, GELU](out_, (t + 2) * OUT + o, d2.reduce_add() + bias)
-                finish[RESID, GELU](out_, (t + 3) * OUT + o, d3.reduce_add() + bias)
-                t += 4
-            while t < T:
-                var d = F32V(0)
-                var xt = x.unsafe_offset(t * IN)
-                for i in range(0, IN, NW):
-                    d = xt.unsafe_load[width=NW](i).fma(row.unsafe_load[width=NW](i), d)
-                finish[RESID, GELU](out_, t * OUT + o, d.reduce_add() + bias)
-                t += 1
+        if ti == full:  # the last OUT % TN rows (the vocabulary, 50257)
+            rows_dot[RESID, GELU, BIAS](out_, x, w, b, T, IN, OUT, full * TN, OUT, row)
+            row.unsafe_free()
+            return
+        var o0 = ti * TN
+        var tile = unsafe_alloc[Float32](IN * TN)
+        for r in range(TN):
+            w.dequant_row(o0 + r, row)
+            for i in range(IN):
+                tile[unsafe_offset = i * TN + r] = row[unsafe_offset=i]
+        # mm_tile reads w.load(i, j) for output columns j = o0 .. o0+TN-1;
+        # shifting the view by -o0 maps them to the tile's columns 0 .. TN-1.
+        var view = DenseMatrix[DType.float32](tile.unsafe_offset(-o0), IN, TN)
+        var t = 0
+        while t + TM <= T:
+            mm_tile[DenseMatrix[DType.float32], TM, NV, RESID, GELU, BIAS](
+                out_, x, view, b, t, o0, IN, OUT
+            )
+            t += TM
+        while t < T:
+            mm_tile[DenseMatrix[DType.float32], 1, NV, RESID, GELU, BIAS](
+                out_, x, view, b, t, o0, IN, OUT
+            )
+            t += 1
+        tile.unsafe_free()
         row.unsafe_free()
 
-    parallelize(task, ntasks)
+    parallelize(tile_task, ntasks)
+
+
+def rows_dot[
+    W: WeightMatrix, //, RESID: Bool, GELU: Bool, BIAS: Bool
+](
+    out_: FPtr,
+    x: FPtr,
+    w: W,
+    b: FPtr,
+    T: Int,
+    IN: Int,
+    OUT: Int,
+    o_start: Int,
+    o_end: Int,
+    row: FPtr,
+):
+    """Output rows o_start..o_end-1, one at a time: dequantize the row into
+    `row`, then dot it with 4 rows of x at a time."""
+    for o in range(o_start, o_end):
+        w.dequant_row(o, row)
+        var bias = Float32(0)
+        comptime if BIAS:
+            bias = b[unsafe_offset=o]
+        var t = 0
+        while t + 4 <= T:
+            var d0 = F32V(0)
+            var d1 = F32V(0)
+            var d2 = F32V(0)
+            var d3 = F32V(0)
+            var x0 = x.unsafe_offset(t * IN)
+            for i in range(0, IN, NW):
+                var wv = row.unsafe_load[width=NW](i)
+                d0 = x0.unsafe_load[width=NW](i).fma(wv, d0)
+                d1 = x0.unsafe_load[width=NW](IN + i).fma(wv, d1)
+                d2 = x0.unsafe_load[width=NW](2 * IN + i).fma(wv, d2)
+                d3 = x0.unsafe_load[width=NW](3 * IN + i).fma(wv, d3)
+            finish[RESID, GELU](out_, t * OUT + o, d0.reduce_add() + bias)
+            finish[RESID, GELU](out_, (t + 1) * OUT + o, d1.reduce_add() + bias)
+            finish[RESID, GELU](out_, (t + 2) * OUT + o, d2.reduce_add() + bias)
+            finish[RESID, GELU](out_, (t + 3) * OUT + o, d3.reduce_add() + bias)
+            t += 4
+        while t < T:
+            var d = F32V(0)
+            var xt = x.unsafe_offset(t * IN)
+            for i in range(0, IN, NW):
+                d = xt.unsafe_load[width=NW](i).fma(row.unsafe_load[width=NW](i), d)
+            finish[RESID, GELU](out_, t * OUT + o, d.reduce_add() + bias)
+            t += 1
 
 
 def linear[
