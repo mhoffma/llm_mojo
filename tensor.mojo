@@ -20,6 +20,7 @@ from std.math import round
 comptime FPtr = Pointer[Float32, MutUntrackedOrigin]
 comptime NW = simd_width_of[DType.float32]()
 comptime F32V = SIMD[DType.float32, NW]
+comptime F32x16 = SIMD[DType.float32, 16]
 
 
 trait WeightMatrix(Deinitable, ImplicitlyCopyable):
@@ -33,7 +34,11 @@ trait WeightMatrix(Deinitable, ImplicitlyCopyable):
     comptime OUT_MAJOR: Bool
     """Storage orientation of the layer matrices. False: [IN, OUT], as in
     Hugging Face's GPT-2 (kernels.matmul). True: [OUT, IN], one output per row,
-    as in GGUF files (kernels.matmul_rows)."""
+    as in GGUF files and QuantMatrix (kernels.matmul_rows)."""
+
+    comptime FROM_GGUF: Bool
+    """True if matrices of this format are read from a GGUF file as stored
+    (GGUFMatrix), False if they are converted from float32 with from_f32."""
 
     @staticmethod
     def name() -> String:
@@ -92,6 +97,7 @@ struct DenseMatrix[dtype: DType](WeightMatrix):
         return "bf16"
 
     comptime OUT_MAJOR = False
+    comptime FROM_GGUF = False
 
     var data: Pointer[Scalar[Self.dtype], MutUntrackedOrigin]
     var rows: Int
@@ -155,7 +161,7 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
     `scale` is a float16 and `zero_point` an unsigned integer code in the same
     range as u, so w = 0 is represented exactly, by u = zero_point. GROUP = 0
     means one group spans the whole reduction axis ("per-channel": one pair
-    per output column of a layer matrix, per vocabulary row of wte).
+    per output of a layer matrix, per vocabulary row of wte).
 
     - Asymmetric: the group's range, widened to include 0, is mapped onto
       [0, 2^BITS - 1]: scale = (max - min) / (2^BITS - 1) and
@@ -164,25 +170,33 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
       scale = max|w| / (2^(BITS-1) - 1), so u - zero_point is a signed code
       centered on zero.
 
-    In a dot product the zero point factors out of each group:
-    sum(x * w) = scale * (sum(x * u) - zero_point * sum(x)), which keeps the
-    inner sum in integers for the integer kernel (M4).
+    Layout: rows are outputs and columns the reduction axis ([OUT, IN] for
+    layer matrices, which `from_f32` transposes from Hugging Face's
+    [IN, OUT]; [V, C] for wte, as is). So a row's groups are contiguous, and
+    the kernels use the fast OUT_MAJOR path (kernels.matmul_rows).
+    int4 codes are packed per 32 weights as in llama.cpp's Q4_0: byte j holds
+    weight j in its low 4 bits and weight j+16 in its high 4, so one mask and
+    one shift unpack 16 weights each.
 
-    Rounding is plain round-to-nearest. int4 packs two codes per byte along
-    each row: byte k holds column 2k in its low 4 bits, 2k+1 in its high 4.
+    In a dot product, the scale and zero point factor out of each group:
+    sum(x * w) = scale * sum(x * (u - zero_point)). `dot_row` applies the
+    scale once per group, and the integer kernel (M4) will keep the inner sum
+    in integers.
+
+    Rounding is plain round-to-nearest.
     """
 
-    comptime OUT_MAJOR = False
+    comptime OUT_MAJOR = True
+    comptime FROM_GGUF = False
     comptime LEVELS = (1 << Self.BITS) - 1  # largest code
     comptime HALF = 1 << (Self.BITS - 1)  # the zero point when symmetric
 
     var data: Pointer[UInt8, MutUntrackedOrigin]  # the codes u
     var scale: Pointer[Float16, MutUntrackedOrigin]  # one per group
     var zero_point: Pointer[UInt8, MutUntrackedOrigin]  # one per group
-    var rows: Int
-    var cols: Int
-    var group: Int  # GROUP, or the reduction axis length when GROUP == 0
-    var reduce_rows: Bool
+    var rows: Int  # outputs
+    var cols: Int  # the reduction axis
+    var group: Int  # GROUP, or cols when GROUP == 0
 
     def __init__(
         out self,
@@ -192,7 +206,6 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
         rows: Int,
         cols: Int,
         group: Int,
-        reduce_rows: Bool,
     ):
         self.data = data
         self.scale = scale
@@ -200,7 +213,6 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
         self.rows = rows
         self.cols = cols
         self.group = group
-        self.reduce_rows = reduce_rows
 
     @staticmethod
     def name() -> String:
@@ -211,112 +223,117 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
     @staticmethod
     def from_f32(src: FPtr, rows: Int, cols: Int, reduce_rows: Bool) -> Self:
         comptime assert Self.BITS == 4 or Self.BITS == 8, "BITS must be 4 or 8"
-        var axis = rows if reduce_rows else cols
-        var group = axis if Self.GROUP == 0 else Self.GROUP
-        if axis % group != 0:
-            abort("group size must divide the reduction axis")
-        var ngroups = rows * cols // group
-        var data = unsafe_alloc[UInt8](rows * cols * Self.BITS // 8)
-        var scale = unsafe_alloc[Float16](ngroups)
-        var zero_point = unsafe_alloc[UInt8](ngroups)
-        var m = Self(data, scale, zero_point, rows, cols, group, reduce_rows)
+        # Stored shape: n rows of k values, k along the reduction axis.
+        var n = cols if reduce_rows else rows
+        var k = rows if reduce_rows else cols
+        var group = k if Self.GROUP == 0 else Self.GROUP
+        if k % group != 0 or group % 32 != 0:
+            abort("group size must divide the reduction axis and be a multiple of 32")
+        var gpr = k // group  # groups per row
+        var data = unsafe_alloc[UInt8](n * k * Self.BITS // 8)
+        var scale = unsafe_alloc[Float16](n * gpr)
+        var zero_point = unsafe_alloc[UInt8](n * gpr)
+        var m = Self(data, scale, zero_point, n, k, group)
 
-        # Visit each group as a list of flat indices: down a column when
-        # reducing rows, along a row otherwise.
-        var idx = List[Int](capacity=group)
-        for gi in range(ngroups):
-            idx.clear()
-            if reduce_rows:
-                var r0 = (gi // cols) * group
-                var c = gi % cols
-                for r in range(r0, r0 + group):
-                    idx.append(r * cols + c)
-            else:
-                var r = gi // (cols // group)
-                var c0 = (gi % (cols // group)) * group
-                for c in range(c0, c0 + group):
-                    idx.append(r * cols + c)
-
-            var lo = Float32(0)  # the range always includes 0
-            var hi = Float32(0)
-            for i in idx:
-                lo = min(lo, src[unsafe_offset=i])
-                hi = max(hi, src[unsafe_offset=i])
-            var s: Float32
-            comptime if Self.SYMMETRIC:
-                s = max(-lo, hi) / Float32(Self.HALF - 1)
-            else:
-                s = (hi - lo) / Float32(Self.LEVELS)
-            if s == 0:  # an all-zero group: any scale reproduces it exactly
-                s = 1
-            # Quantize against the float16-rounded scale actually stored.
-            var s16 = s.cast[DType.float16]()
-            var sf = s16.cast[DType.float32]()
-            var zp: Int
-            comptime if Self.SYMMETRIC:
-                zp = Self.HALF
-            else:
-                zp = clamp_code(Int(round(-lo / sf)), Self.LEVELS)
-            scale[unsafe_offset=gi] = s16
-            zero_point[unsafe_offset=gi] = UInt8(zp)
-            for i in idx:
-                var u = Int(round(src[unsafe_offset=i] / sf)) + zp
-                m.set_code(i, clamp_code(u, Self.LEVELS))
+        var vals = List[Float32](length=group, fill=0)
+        for r in range(n):
+            for g in range(gpr):
+                # Gather the group: element (r, c) of the stored matrix is
+                # src[c][r] when transposing, src[r][c] otherwise.
+                var lo = Float32(0)  # the range always includes 0
+                var hi = Float32(0)
+                for j in range(group):
+                    var c = g * group + j
+                    var v = src[unsafe_offset = c * cols + r] if reduce_rows else src[
+                        unsafe_offset = r * cols + c
+                    ]
+                    vals[j] = v
+                    lo = min(lo, v)
+                    hi = max(hi, v)
+                var s: Float32
+                comptime if Self.SYMMETRIC:
+                    s = max(-lo, hi) / Float32(Self.HALF - 1)
+                else:
+                    s = (hi - lo) / Float32(Self.LEVELS)
+                if s == 0:  # an all-zero group: any scale reproduces it exactly
+                    s = 1
+                # Quantize against the float16-rounded scale actually stored.
+                var s16 = s.cast[DType.float16]()
+                var sf = s16.cast[DType.float32]()
+                var zp: Int
+                comptime if Self.SYMMETRIC:
+                    zp = Self.HALF
+                else:
+                    zp = clamp_code(Int(round(-lo / sf)), Self.LEVELS)
+                scale[unsafe_offset = r * gpr + g] = s16
+                zero_point[unsafe_offset = r * gpr + g] = UInt8(zp)
+                for j in range(group):
+                    var u = Int(round(vals[j] / sf)) + zp
+                    m.set_code(r, g * group + j, clamp_code(u, Self.LEVELS))
         return m
 
-    def set_code(self, i: Int, u: Int):
+    def set_code(self, row: Int, col: Int, u: Int):
+        var p = self.data.unsafe_offset(row * self.cols * Self.BITS // 8)
         comptime if Self.BITS == 8:
-            self.data[unsafe_offset=i] = UInt8(u)
+            p[unsafe_offset=col] = UInt8(u)
         else:
-            var b = self.data[unsafe_offset = i // 2]
-            if i % 2 == 0:
+            # Chunk col // 32; within it, weight j is in byte j % 16, in the
+            # low nibble for j < 16 and the high nibble otherwise.
+            var j = col % 32
+            var i = (col // 32) * 16 + j % 16
+            var b = p[unsafe_offset=i]
+            if j < 16:
                 b = (b & 0xF0) | UInt8(u)
             else:
                 b = (b & 0x0F) | UInt8(u << 4)
-            self.data[unsafe_offset = i // 2] = b
+            p[unsafe_offset=i] = b
 
     @always_inline
-    def codes[width: Int](self, row: Int, col: Int) -> SIMD[DType.float32, width]:
-        """The raw codes u for `width` columns, as float32."""
-        var i = row * self.cols + col
-        comptime if Self.BITS == 8:
-            return self.data.unsafe_load[width=width](i).cast[DType.float32]()
-        else:
-            var b = self.data.unsafe_load[width = width // 2](i // 2)
-            var u = (b & 0x0F).interleave(b >> 4)
-            return rebind[SIMD[DType.uint8, width]](u).cast[DType.float32]()
-
-    @always_inline
-    def load[width: Int](self, row: Int, col: Int) -> SIMD[DType.float32, width]:
-        var u = self.codes[width](row, col)
-        if self.reduce_rows:
-            # Groups run down the rows: each column has its own scale and
-            # zero point, so load `width` of each.
-            var g = (row // self.group) * self.cols + col
-            var s = self.scale.unsafe_load[width=width](g).cast[DType.float32]()
-            var zp = self.zero_point.unsafe_load[width=width](g).cast[
-                DType.float32
-            ]()
-            return (u - zp) * s
-        else:
-            # Groups run along the row: `width` columns share one scale and
-            # zero point (width divides the group size).
-            var g = (row * self.cols + col) // self.group
-            var s = self.scale[unsafe_offset=g].cast[DType.float32]()
-            var zp = self.zero_point[unsafe_offset=g].cast[DType.float32]()
-            return (u - SIMD[DType.float32, width](zp)) * SIMD[
-                DType.float32, width
-            ](s)
+    def row_op[DOT: Bool](self, row: Int, dst: FPtr, x: FPtr) -> F32x16:
+        """Dequantizes a row into dst or, with DOT, returns the partial sums
+        of its dot product with x (16 lanes, to be added up)."""
+        var p = self.data.unsafe_offset(row * self.cols * Self.BITS // 8)
+        var gpr = self.cols // self.group
+        var acc = F32x16(0)
+        for g in range(gpr):
+            var s = F32x16(self.scale[unsafe_offset = row * gpr + g].cast[DType.float32]())
+            var zp = F32x16(Float32(Int(self.zero_point[unsafe_offset = row * gpr + g])))
+            var accg = F32x16(0)  # this group's sum of x * (u - zero_point)
+            for c in range(self.group // 32):
+                var k0 = g * self.group + 32 * c
+                var v0: F32x16
+                var v1: F32x16
+                comptime if Self.BITS == 4:
+                    var b = p.unsafe_load[width=16](k0 // 2)
+                    v0 = (b & 0xF).cast[DType.float32]() - zp
+                    v1 = (b >> 4).cast[DType.float32]() - zp
+                else:
+                    v0 = p.unsafe_load[width=16](k0).cast[DType.float32]() - zp
+                    v1 = p.unsafe_load[width=16](k0 + 16).cast[DType.float32]() - zp
+                comptime if DOT:
+                    accg = v0.fma(x.unsafe_load[width=16](k0), accg)
+                    accg = v1.fma(x.unsafe_load[width=16](k0 + 16), accg)
+                else:
+                    dst.unsafe_store(k0, v0 * s)
+                    dst.unsafe_store(k0 + 16, v1 * s)
+            comptime if DOT:
+                acc = accg.fma(s, acc)
+        return acc
 
     def dequant_row(self, row: Int, dst: FPtr):
-        for i in range(0, self.cols, NW):
-            dst.unsafe_store(i, self.load[NW](row, i))
+        _ = self.row_op[False](row, dst, dst)
 
     def dot_row(self, row: Int, x: FPtr) -> Float32:
-        var d = F32V(0)
-        for i in range(0, self.cols, NW):
-            d = self.load[NW](row, i).fma(x.unsafe_load[width=NW](i), d)
-        return d.reduce_add()
+        return self.row_op[True](row, x, x).reduce_add()
+
+    def load[width: Int](self, row: Int, col: Int) -> SIMD[DType.float32, width]:
+        """Slow path, for completeness: dequantizes the whole row. The
+        kernels use dequant_row and dot_row instead."""
+        var buf = unsafe_alloc[Float32](self.cols)
+        self.dequant_row(row, buf)
+        var v = buf.unsafe_load[width=width](col)
+        buf.unsafe_free()
+        return v
 
     def nbytes(self) -> Int:
         """Codes, plus a float16 scale and a one-byte zero point per group."""

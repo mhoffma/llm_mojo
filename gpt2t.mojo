@@ -840,7 +840,7 @@ def evaluate[W: WeightMatrix, E: WeightMatrix](args: Args) raises:
 def load[W: WeightMatrix, E: WeightMatrix](args: Args) raises -> Model[W, E]:
     """Loads the model for formats W and E: from --gguf for GGUF, otherwise
     from the Hugging Face safetensors, converted."""
-    comptime if W.OUT_MAJOR:
+    comptime if W.FROM_GGUF:
         # W and E are GGUFMatrix here; rebind_var tells the compiler so.
         return rebind_var[Model[W, E]](load_gguf(args.gguf))
     else:

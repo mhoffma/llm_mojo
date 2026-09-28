@@ -49,8 +49,8 @@ accuracy each format costs for that speed**.
 | Probes: VNNI, float16/bfloat16 | ✅ done (`research/`) |
 | M1. Generic weight formats, float32 bit-identical to baseline | ✅ done |
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
-| M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | 🔄 f16/bf16, GGUF with fast kernels, own int4 with int8 head (accuracy) done; fast kernels for our formats next |
-| M4. int16 activations + integer VNNI kernel (W4A16) | ☐ |
+| M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
+| M4. int16 activations + integer VNNI kernel (W4A16) | ⏭ next |
 | M5. Tuning and final results table | ☐ |
 | M6. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
@@ -305,10 +305,16 @@ in a sweep.
   Asymmetric beats symmetric at every group size, and smaller groups are
   better (see Results). By KL, int4-g32 + int8 head (0.147) sits between
   GGUF Q4_0 (0.170) and Q4_K_M (0.098).
-- Our formats are still slow (int4-g32 decodes at ~25 tok/s): they use the
-  `[IN, OUT]` kernels, which dequantize through the generic `load`. Next:
-  give them the GGUF treatment (an `[OUT, IN]` block layout with SIMD fused
-  dot, or fast `[IN, OUT]` kernels). The cause is
+- **Fast kernels for our formats** (2026-09-28): `QuantMatrix` now stores
+  `[OUT, IN]` (layer matrices are transposed in `from_f32`), so each row's
+  groups are contiguous and it takes the OUT_MAJOR path (`matmul_rows`: fused
+  dot for decode, float32 tiles for prefill). int4 is packed per 32 weights
+  like Q4_0 (byte j = weights j and j+16). `dot_row` sums x·(u − zero_point)
+  per group and applies the scale once per group. int4-g32 decode went from
+  ~25 to ~99 tok/s, matching f16 at 37% of its size; int8-ch is the fastest
+  format at ~124 tok/s. Perplexities still match NumPy to 6 digits and
+  greedy decoding matches exactly. A trait member `FROM_GGUF` now marks
+  GGUFMatrix (OUT_MAJOR no longer implies GGUF). The cause is
   the output head: we quantize the tied `wte` together with everything else,
   while llama.cpp keeps GPT-2's output head at 6-bit (Q6_K). GGUF Q4_0, whose
   layer matrices use nearly our `int4-g32-sym` scheme, reaches 27.2 with its
@@ -472,7 +478,9 @@ prompt. Decode: 200 tokens after a short prompt / after the 476-token prompt.
 Perplexity, top-1 agreement, and KL are on `tests/data/alice_ch1.txt` (see
 [Accuracy harness](#accuracy-harness)). GGUF speeds are medians of 3 rounds
 of `tests/bench.sh`, measured together with f32 (559 / 60 / 45) and f16
-(562 / 88 / 73) in the same session. Speed ranges are from two interleaved
+(562 / 88 / 73) in the same session. *Our int formats: medians of 3 rounds
+on battery, measured with f16 (561 / 100 / 85), Q4_K_M (608 / 108 / 89) and
+Q4_0 (605 / 92 / 79) in the same session. Speed ranges are from two interleaved
 rounds; the machine's speed drifts by ±15% between runs (thermal), so compare
 formats measured in the same session.
 
@@ -496,9 +504,9 @@ Notes on f16 / bf16:
 | f32 (`gpt2t`) | 474 MB | same | same | 25.284 | 100% (bit-identical) | 0 |
 | f16 | 239 MB | 504–562 | 64–77 / 59–65 | 25.302 (+0.07%) | 99.67% | 1.7e-5 |
 | bf16 | 239 MB | 603–613 | 78–82 / 67–69 | 25.073 (−0.84%) | 95.13% | 7.4e-3 |
-| int8, per-channel (ours, head int8) | 121 MB | 518 | 27 / 26 | 26.116 (+3.29%) | 81.6% | 4.6e-2 |
-| **int4, group 32 + int8 head (ours)** | 88 MB | 386 | 25 / 20 | **25.592 (+1.22%)** | 75.1% | 1.5e-1 |
-| int4, group 64 + int8 head (ours) | | | | 27.560 (+9.0%) | | |
+| int8, per-channel (ours, head int8) | 121 MB | 660* | 124 / 101* | 26.116 (+3.29%) | 81.6% | 4.6e-2 |
+| **int4, group 32 + int8 head (ours)** | 88 MB | 642* | 99 / 85* | **25.592 (+1.22%)** | 75.1% | 1.5e-1 |
+| int4, group 64 + int8 head (ours) | 84 MB | 668* | 111 / 92* | 27.560 (+9.0%) | | |
 | int4, group 128 + int8 head (ours) | | | | 27.672 (+9.4%) | | |
 | int4, per-channel + int8 head (ours) | | | | 28.821 (+14.0%) | | |
 | int4, group 32 sym + int8 head (ours) | | | | 29.806 (+17.9%) | | |
