@@ -50,7 +50,7 @@ accuracy each format costs for that speed**.
 | M1. Generic weight formats, float32 bit-identical to baseline | ✅ done |
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
-| M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~147 tok/s) at +1.2% perplexity; clean prefill re-benchmark pending |
+| M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
 | M5. Tuning and final results table | ☐ |
 | M6. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
@@ -152,8 +152,9 @@ users can install Modular's Mojo extension.
 | Path | What |
 |---|---|
 | `gpt2.mojo` | **Frozen float32 baseline.** Single file, known correct. Don't change it; it's the reference the generic version is tested against. |
-| `gpt2t.mojo` | The generic version: `Model[W]`, sampling, CLI, and `main`, which picks the format from `--dtype` |
-| `tensor.mojo` | The `WeightMatrix` trait and our formats: `DenseMatrix[dtype]`, `QuantMatrix[bits, group, symmetric]` |
+| `README.md` | Project overview: features, results, setup, tensor structure, kernels |
+| `gpt2t.mojo` | The generic version: `Model[W, E]`, loaders, sampling, evaluation, CLI, and `main`, which picks the formats from `--dtype` / `--head` / `--gguf` |
+| `tensor.mojo` | The `WeightMatrix` trait and our formats: `DenseMatrix[dtype]`, `QuantMatrix[bits, group, symmetric, a16]` |
 | `gguf.mojo` | GGUF file reader and `GGUFMatrix`: dequantizes Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 |
 | `kernels.mojo` | matmul (prefill), GEMV (decode), `matmul_rows` for `[OUT, IN]` weights, LayerNorm, attention, output head; generic over `W: WeightMatrix` |
 | `tokenizer.mojo` | GPT-2 byte-level BPE tokenizer (reads `vocab.json`, `merges.txt`) |
@@ -219,19 +220,13 @@ over it is compiled separately for each concrete type with its methods
 inlined, so the abstraction costs nothing in the inner loops (M1 measured it:
 the generic float32 build is as fast as the baseline).
 
-```mojo
-trait WeightMatrix(Deinitable, ImplicitlyCopyable):
-    comptime NAME: StaticString                      # the --dtype name
-    @staticmethod
-    def from_f32(src: FPtr, rows: Int, cols: Int) -> Self   # convert at load time
-    def load[width: Int](self, row: Int, col: Int) -> SIMD[DType.float32, width]
-    def nbytes(self) -> Int
-    def free(self)
-```
+The current trait, the formats' storage layouts (including the int4 packing
+and the group-per-lane decode layout) and the kernel dispatch are described
+in [README.md](README.md#tensor-structure); `tensor.mojo` is the source of
+truth. What follows in this section is the original M1 design.
 
 - Values are **handles** (a pointer plus shape). Copying copies the handle;
   `Model` owns them and calls `free` once in its destructor.
-- `load` returns float32. Activations and arithmetic stay float32 until M4.
 - `main` turns the runtime `--dtype` string into a compile-time type once:
   `run[DenseMatrix[DType.float32]](args)`. Everything under `run` is
   specialized for that format.
@@ -316,12 +311,11 @@ in a sweep.
   ~25 to ~99 tok/s, matching f16 at 37% of its size; int8-ch is the fastest
   format at ~124 tok/s. Perplexities still match NumPy to 6 digits and
   greedy decoding matches exactly. A trait member `FROM_GGUF` now marks
-  GGUFMatrix (OUT_MAJOR no longer implies GGUF). The cause is
-  the output head: we quantize the tied `wte` together with everything else,
-  while llama.cpp keeps GPT-2's output head at 6-bit (Q6_K). GGUF Q4_0, whose
-  layer matrices use nearly our `int4-g32-sym` scheme, reaches 27.2 with its
-  6-bit head. Next for our formats: keep the head at int8/f16 (a separate
-  format for `lm`, which Model already has as its own field).
+  GGUFMatrix (OUT_MAJOR no longer implies GGUF).
+- Why int4 first failed (before the int8 head): we quantized the tied `wte`
+  together with everything else, while llama.cpp keeps GPT-2's output head
+  at 6-bit (Q6_K). GGUF Q4_0, whose layer matrices use nearly our
+  `int4-g32-sym` scheme, reaches 27.2 with its 6-bit head.
 - **GGUF** (`--gguf FILE`, gguf.mojo): pre-quantized GPT-2 124M files from
   Hugging Face, used as stored. GGUF keeps matrices as `[OUT, IN]` with
   blocks along the input axis, so they use `matmul_rows` (dequantize a row,
@@ -427,10 +421,9 @@ Expectation to test: per-channel is fine for int8, but at int4 groups of
   (`permute_x_i16`). Prefill unpacks this layout with SIMD plus one int32
   store per lane pair. int4-g32-a16 decode: 95 / 78 → **147 / 114 tok/s**
   (clean run, AC). Kernel tests pass (max error 3e-7), perplexity and greedy
-  decode unchanged. Prefill after the SIMD unpack could only be measured
-  under load (Chrome etc., load average 5-6): on par with int4-ch-a16
-  (721 vs 683; that format reached ~900 when idle). Re-benchmark on an idle
-  machine.
+  decode unchanged. Prefill after the SIMD unpack, re-measured on a quieter
+  machine (load ~1-2, AC, 3 rounds): int4-g32-a16 803 tok/s (594-867),
+  int4-ch-a16 851, f16 545; decode 140 / 105 vs 113 / 76 and 79 / 67.
 
 Original plan:
 
@@ -555,7 +548,8 @@ tiles: 3 rounds on AC with f16 (538 / 84 / 58), int4-g32 (679 / 85 / 68),
 int8-ch (624 / 112 / 79). int4-g128-a16's prefill was measured before the
 tiles. ¶With the group-per-lane decode layout: 3 rounds on AC with int4-g32
 (595 / 88 / 74), int4-ch-a16 (920 / 130 / 102), int8-ch-a16 (905 / 138 /
-113), f16 (546 / 90 / 38). Speed ranges are from two interleaved
+113), f16 (546 / 90 / 38). Prefill 803 is from a later 3-round re-run with
+f16 (545 / 79 / 67) and int4-ch-a16 (851 / 113 / 76). Speed ranges are from two interleaved
 rounds; the machine's speed drifts by ±15% between runs (thermal), so compare
 formats measured in the same session.
 
@@ -594,7 +588,7 @@ Notes on f16 / bf16:
 | GGUF Q4_0 (head Q6_K) | 99 MB | 710 | 80 / 79 | 27.178 (+7.49%) | 74.6% | 1.7e-1 |
 | GGUF Q4_K_M (Q4_K/Q5_K/Q6_K, head Q6_K) | 105 MB | 690 | 107 / 90 | 25.460 (+0.70%) | 80.2% | 9.8e-2 |
 | GGUF i1-Q4_K_M (NumPy only so far) | 105 MB | | | 27.615 (+9.2%) | | |
-| **int4, group 32, W4A16 + int8 head (A16)** | 88 MB | ~885§ (re-measure) | **147 / 114**¶ | 25.593 (+1.22%) | | |
+| **int4, group 32, W4A16 + int8 head (A16)** | 88 MB | 803¶ | **147 / 114**¶ (140 / 105 in the re-run) | 25.593 (+1.22%) | | |
 | int8, per-channel, W8A16 | 121 MB | **899**§ | 135 / 103§ (152 / 119†) | 26.117 (+3.29%) | | |
 | int4, group 128, W4A16 | 82 MB | 469‡ | 126 / 105‡ | | | |
 | int4, per-channel, W4A16 | 81 MB | 888§ | 126 / 100§ | | | |
