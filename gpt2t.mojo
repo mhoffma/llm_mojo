@@ -28,6 +28,8 @@ Usage:
                  int8
     --attention  float (default) or int: attention in integers (int8 cache
                  in VNNI layouts, integer softmax; int_attention.mojo)
+    --profile    print time per operation (per decode and prompt token) at
+                 the end
     --gguf FILE  use the weights in a llama.cpp GGUF file of GPT-2 124M
                  (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 tensors), as
                  stored; overrides --dtype. The tokenizer still comes from -m.
@@ -101,6 +103,29 @@ comptime VEC_NAMES = [
 ]
 comptime VEC_LENS = [C, C, 3 * C, C, C, C, 4 * C, C]
 comptime LAYER_VEC_FLOATS = 13 * C  # sum of VEC_LENS
+
+# Profiling (--profile): time per operation, for prompt and decode tokens.
+comptime P_EMBED = 0
+comptime P_LN = 1  # both LayerNorms and the final one
+comptime P_QKV = 2
+comptime P_KVSTORE = 3
+comptime P_ATTN = 4
+comptime P_PROJ = 5
+comptime P_FC = 6
+comptime P_FCPROJ = 7
+comptime P_HEAD = 8
+comptime P_N = 9
+comptime P_NAMES = [
+    "embedding",
+    "layernorm",
+    "qkv matmul",
+    "kv store",
+    "attention",
+    "attn proj matmul",
+    "mlp up matmul",
+    "mlp down matmul",
+    "output head",
+]
 
 
 # ===----------------------------------------------------------------------=== #
@@ -191,6 +216,8 @@ struct Model[
     var logits: FPtr
     var kv: Self.KV  # keys and values of past tokens, all layers
     var scratch: FPtr  # gemv partial sums
+    var prof: Pointer[Int, MutUntrackedOrigin]  # ns per [phase][P_*]; phase 0 = decode, 1 = prompt
+    var prof_tokens: Pointer[Int, MutUntrackedOrigin]  # tokens per phase
 
     def __init__(
         out self,
@@ -230,6 +257,12 @@ struct Model[
         self.logits = unsafe_alloc[Float32](V)
         self.kv = Self.KV.create(N_LAYER, MAX_T, N_HEAD, HS)
         self.scratch = unsafe_alloc[Float32](MAX_PARTS * 4 * C)
+        self.prof = unsafe_alloc[Int](2 * P_N)
+        self.prof_tokens = unsafe_alloc[Int](2)
+        for i in range(2 * P_N):
+            self.prof[unsafe_offset=i] = 0
+        self.prof_tokens[unsafe_offset=0] = 0
+        self.prof_tokens[unsafe_offset=1] = 0
 
     def __deinit__(deinit self):
         self.wte.free()
@@ -247,6 +280,8 @@ struct Model[
         self.logits.unsafe_free()
         self.kv.free()
         self.scratch.unsafe_free()
+        self.prof.unsafe_free()
+        self.prof_tokens.unsafe_free()
 
     def weight_bytes(self) -> Int:
         """Bytes of all parameters, as stored."""
@@ -257,30 +292,73 @@ struct Model[
             n += m.nbytes()
         return n + SMALL_FLOATS * 4
 
+    @always_inline
+    def tick(self, cat: Int, phase: Int, t0: Int) -> Int:
+        """Adds the time since t0 to category cat; returns the current time.
+        """
+        var now = perf_counter_ns()
+        self.prof[unsafe_offset = phase * P_N + cat] += Int(now - t0)
+        return now
+
     def forward(self, tokens: List[Int], pos0: Int) -> FPtr:
         """Runs tokens at positions pos0.. and returns the last token's logits.
         """
+        var ph = 0 if len(tokens) == 1 else 1
         self.blocks(tokens, pos0)
+        var t = perf_counter_ns()
         var last = self.x.unsafe_offset((len(tokens) - 1) * C)
         layernorm[C](self.xn, last, self.lnf_w, self.lnf_b, 1)
+        t = self.tick(P_LN, ph, t)
         head(self.logits, self.xn, self.lm, 1, V, C)
+        _ = self.tick(P_HEAD, ph, t)
         return self.logits
 
     def forward_all(self, tokens: List[Int], logits: FPtr):
         """Runs tokens from position 0 and writes logits for every position
         into logits[T, V]. Row t predicts tokens[t + 1]."""
         var T = len(tokens)
+        var ph = 0 if T == 1 else 1
         self.blocks(tokens, 0)
+        var t = perf_counter_ns()
         layernorm[C](self.xn, self.x, self.lnf_w, self.lnf_b, T)
+        t = self.tick(P_LN, ph, t)
         head(logits, self.xn, self.lm, T, V, C)
+        _ = self.tick(P_HEAD, ph, t)
+
+    def print_profile(self):
+        """Prints time per token by operation, for decode and prompt tokens
+        (--profile)."""
+        for ph in range(2):
+            var n = self.prof_tokens[unsafe_offset=ph]
+            if n == 0:
+                continue
+            var total = 0
+            for c in range(P_N):
+                total += self.prof[unsafe_offset = ph * P_N + c]
+            print(
+                "decode" if ph == 0 else "prompt", "(", n, "tokens):",
+                Float64(total) / 1e6 / Float64(n), "ms per token",
+                file=FileDescriptor(2),
+            )
+            comptime for c in range(P_N):
+                comptime label = P_NAMES[c]
+                var ns = self.prof[unsafe_offset = ph * P_N + c]
+                print(
+                    "   ", label, ":", Float64(ns) / 1e3 / Float64(n), "us  (",
+                    Int(Float64(ns) * 100 / Float64(max(total, 1))), "% )",
+                    file=FileDescriptor(2),
+                )
 
     def blocks(self, tokens: List[Int], pos0: Int):
         """Embeds tokens at positions pos0.. and runs all transformer blocks,
         leaving the result in self.x and filling the KV cache."""
         var T = len(tokens)
+        var ph = 0 if T == 1 else 1
+        self.prof_tokens[unsafe_offset=ph] += T
         var x = self.x
         var xn = self.xn
         var qkv = self.qkv
+        var tm = perf_counter_ns()
         for t in range(T):
             var p = self.wpe.unsafe_offset((pos0 + t) * C)
             var xt = x.unsafe_offset(t * C)
@@ -289,6 +367,7 @@ struct Model[
                 xt.unsafe_store(
                     i, xt.unsafe_load[width=NW](i) + p.unsafe_load[width=NW](i)
                 )
+        tm = self.tick(P_EMBED, ph, tm)
 
         for l in range(N_LAYER):
             var m = self.mats.unsafe_ptr().unsafe_offset(l * N_MATS)
@@ -297,6 +376,7 @@ struct Model[
             layernorm[C](
                 xn, x, v[unsafe_offset=LN1_W], v[unsafe_offset=LN1_B], T
             )
+            tm = self.tick(P_LN, ph, tm)
             linear(
                 qkv,
                 xn,
@@ -307,6 +387,7 @@ struct Model[
                 3 * C,
                 self.scratch,
             )
+            tm = self.tick(P_QKV, ph, tm)
             # Each new token's key and value (columns C.. and 2C.. of its qkv
             # row) go into the cache, then attention reads it.
             for t in range(T):
@@ -314,7 +395,9 @@ struct Model[
                 self.kv.store(
                     l, pos0 + t, row.unsafe_offset(C), row.unsafe_offset(2 * C)
                 )
+            tm = self.tick(P_KVSTORE, ph, tm)
             attention[N_HEAD, HS](self.att, qkv, self.kv, l, T, pos0)
+            tm = self.tick(P_ATTN, ph, tm)
             linear[RESID=True](
                 x,
                 self.att,
@@ -325,10 +408,12 @@ struct Model[
                 C,
                 self.scratch,
             )
+            tm = self.tick(P_PROJ, ph, tm)
 
             layernorm[C](
                 xn, x, v[unsafe_offset=LN2_W], v[unsafe_offset=LN2_B], T
             )
+            tm = self.tick(P_LN, ph, tm)
             linear[GELU=True](
                 self.fc,
                 xn,
@@ -339,6 +424,7 @@ struct Model[
                 4 * C,
                 self.scratch,
             )
+            tm = self.tick(P_FC, ph, tm)
             linear[RESID=True](
                 x,
                 self.fc,
@@ -349,6 +435,7 @@ struct Model[
                 C,
                 self.scratch,
             )
+            tm = self.tick(P_FCPROJ, ph, tm)
 
 
 # The small float32 tensors, in the order Model's constructor takes them:
@@ -545,6 +632,7 @@ struct Args(Movable):
     var head: String  # output head format for int formats: int8 or same
     var kv: String  # KV cache format, or "auto" for the weights' default
     var attention: String  # "float", or "int" (integer attention, int8 cache)
+    var profile: Bool  # print time per operation at the end
 
     def __init__(out self) raises:
         self.dtype = "f32"
@@ -561,6 +649,7 @@ struct Args(Movable):
         self.head = "int8"
         self.kv = "auto"
         self.attention = "float"
+        self.profile = False
         var args = argv()
         var a = 1
         while a < len(args):
@@ -569,6 +658,8 @@ struct Args(Movable):
                 self.verbose = True
             elif arg == "--compare":
                 self.compare = True
+            elif arg == "--profile":
+                self.profile = True
             elif arg.startswith("-") and a + 1 < len(args):
                 var val = String(args[a + 1])
                 if arg == "--dtype":
@@ -676,6 +767,8 @@ def generate[
         "tok/s )",
         file=FileDescriptor(2),
     )
+    if args.profile:
+        model.print_profile()
 
 
 # ===----------------------------------------------------------------------=== #

@@ -179,6 +179,7 @@ Timing and model size are printed to stderr after the generated text.
 | `-v` | print the prompt's token ids and the top-5 next-token logits | off |
 | `--ppl FILE` | measure perplexity on a text file instead of generating | |
 | `--compare` | with `--ppl`: also run float32 and report agreement, KL, logit differences | off |
+| `--profile` | print time per token by operation (each matmul, attention, KV store, output head, …), for decode and prompt tokens | off |
 
 **`--dtype` formats:**
 

@@ -52,7 +52,7 @@ accuracy each format costs for that speed**.
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
 | M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) + integer attention | ✅ done: int8 cache default for quantized models (+10-16% long-context decode); `--attention int` (integer attention on an int8 VNNI-layout cache) another +9-15% long-context decode at no accuracy cost |
-| M6. Tuning and final results table | ☐ |
+| M6. Tuning and final results table | 🔄 profiling done (`--profile`); vectorized KV store, then fewer thread wake-ups next |
 | M7. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
 ## Getting started
@@ -114,6 +114,7 @@ Options (both programs; `--dtype` only in `gpt2t`):
 | `--head FMT` | with an int `--dtype`: format of wte (embedding + output head), `int8` or `same` | `int8` |
 | `--kv FMT` | KV cache format: `auto` (f32/f16/bf16 weights keep their type, quantized weights get `int8`), `f32`, `f16`, `bf16`, `int16`, `int8` | `auto` |
 | `--attention A` | `float`, or `int`: attention in integers (needs the int8 cache) | `float` |
+| `--profile` | print time per token by operation, for decode and prompt tokens | off |
 | `-m DIR` | directory with the Hugging Face files | `gpt2` |
 | `-n N` | tokens to generate | 64 |
 | `-t TEMP` | sampling temperature; `0` = greedy | 0.8 |
@@ -708,6 +709,46 @@ Kernel tuning for the quantized paths (tile sizes, prefetching, thread
 split), a faster output head (38.6M weights per token, the biggest single
 decode cost), fewer thread wake-ups per token (~60 parallel regions), then a
 clean re-run of the [Results](#results) table.
+
+**Profiling (2026-09-28).** `--profile` prints time per token by operation
+(embedding, LayerNorm, each matmul, KV store, attention, output head),
+separately for decode and prompt tokens. The timers are always on (a clock
+read is ~20 ns, ~100 per ~7-10 ms token); the flag only prints them.
+
+int4-g32-a16 with integer attention, 200 decoded tokens (load ~3.5, so
+absolute times are inflated; the shares are what matter):
+
+| operation | decode, short ctx | share | decode after 476 | prompt (476) per token |
+|---|---|---|---|---|
+| mlp up matmul | 2.40 ms | 24% | 3.12 ms | 0.33 ms (23%) |
+| mlp down matmul | 2.00 ms | 20% | 2.61 ms | 0.35 ms (24%) |
+| qkv matmul | 1.85 ms | 19% | 2.34 ms | 0.24 ms (17%) |
+| output head | 1.63 ms | 16% | 2.04 ms | ~0 (last token only) |
+| attn proj matmul | 1.25 ms | 12% | 1.49 ms | 0.10 ms (7%) |
+| attention | 0.39 ms | 4% | 1.78 ms | 0.18 ms (12%) |
+| kv store | 0.17 ms | 2% | 0.21 ms | 0.18 ms (12%) |
+| total | 9.7 ms | | 13.6 ms | 1.41 ms |
+
+Findings:
+- **Every matmul call pays ~80 µs whatever its size.** Per call: attn
+  proj (0.3 MB of int4 weights) 104 µs, qkv (0.9 MB) 154 µs, mlp down
+  (1.2 MB) 167 µs, mlp up (1.2 MB) 200 µs: a straight-line fit gives
+  ~80 µs fixed + ~80 µs per MB. With 48 matmul calls per token, the fixed
+  part is ~3.8 ms, ~40% of decode. It is the cost of a parallel region:
+  waking the (sleeping, since busy-waiting hurt: see the
+  MODULAR_THREAD_BUSY_WAIT_US note) worker threads and waiting for all of
+  them.
+- The integer cache's `store` writes each value into its interleaved
+  layout one scalar at a time: 12% of prompt time.
+
+Next steps, in order:
+1. Vectorize `IntAttnKV.store`.
+2. A research probe comparing a spin barrier among a persistent team of
+   threads with a parallel region, then (if it's much cheaper) run each
+   token's per-layer work inside one parallel region with barriers between
+   operations, as llama.cpp does.
+3. A faster output head (16% of decode).
+4. A clean results run of every format on a quiet machine.
 
 ### M7. Stretch
 
