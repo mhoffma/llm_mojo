@@ -46,18 +46,19 @@ dtype int4-g32-a16+head-int8-ch-a16 | 88 MB | load 2391 ms | prompt 12 tokens in
 - **Integer inference (W4A16 / W8A16).** Activations are quantized to int16 at run time, and matmuls run as int16 × int16 → int32 with the AVX-512 VNNI `VPDPWSSD` instruction:
   - Decode (one token at a time) uses a custom group-per-lane code layout.
   - Prompts use a VNNI register-tiled kernel.
-  - int4 group 32 with int16 activations is our fastest decoder (~140 tok/s), at +1.2% perplexity and 88 MB.
+  - int4 group 32 with int16 activations and integer attention is our fastest decoder (~235 tok/s after a short prompt), at +1.2% perplexity and 88 MB.
 - **Fast kernels for every format:**
   - SIMD dequantization with the dot product fused in, for decode
   - dequantize-once float32 tiles, or integer VNNI tiles, for prompt processing
-  - multithreading tuned for a 4-core laptop
+  - multithreading tuned for a 4-core laptop: each decoded token runs as one parallel region, with a team of threads (one per core) that meet at a barrier between operations
 - **An accuracy harness.** `--ppl FILE --compare` measures perplexity with sliding windows, top-1 agreement with float32, KL divergence from float32, and logit differences.
 - **Verification at every level:**
   - a NumPy GPT-2 reference that also implements every quantization scheme
   - a dequantization check against llama.cpp's Python `gguf` package
   - kernel unit tests against exact float64 arithmetic
   - a bit-exactness test against the float32 baseline
-- **Learning material.** `research/` holds small, commented Mojo programs, each answering one question (VNNI from Mojo, float16/bfloat16 support, dequantization speed). `PLAN.md` documents every decision, measurement and Mojo 1.1 pitfall met along the way.
+- **Profiling built in.** `--profile` prints the time per token of each operation (every matmul, attention, KV store, output head) for prompt and decode tokens.
+- **Learning material.** `research/` holds small, commented Mojo programs, each answering one question (VNNI from Mojo, float16/bfloat16 support, dequantization speed, integer softmax, spin barriers vs parallel regions). `PLAN.md` documents every decision, measurement and Mojo 1.1 pitfall met along the way.
 
 ## Results
 
@@ -66,6 +67,7 @@ All measurements are on an Intel i7-1160G7 laptop (Tiger Lake, 4 cores / 8 threa
 - **Accuracy** is measured on `tests/data/alice_ch1.txt` (3,307 scored tokens) against float32. Lower perplexity is better; lower KL means closer to float32.
 - **Prompt speed** is for a 476-token prompt. **Decode speed** is for 100–200 generated tokens after a short prompt.
 - Speeds are medians of 2–3 interleaved rounds (`tests/bench.sh`). The machine drifts by about ±15% between sessions, so treat them as approximate. Session-by-session numbers are in [`PLAN.md`](PLAN.md#results).
+- **The decode speeds in this table were measured before the team decode (M6),** which made decoding about 40% faster; see [Decode with a thread team](#decode-with-a-thread-team) for current numbers. A clean re-run of every format is planned.
 
 | Format | Weights | Perplexity (Δ vs f32) | Top-1 vs f32 | Mean KL vs f32 | Prompt tok/s | Decode tok/s |
 |---|---|---|---|---|---|---|
@@ -99,6 +101,7 @@ All measurements are on an Intel i7-1160G7 laptop (Tiger Lake, 4 cores / 8 threa
 - **int16 activations cost nothing in accuracy** (int4-g32: 25.5921 → 25.5910) **and make the integer kernels faster**:
   - Decode: int4-g32 95 → ~140 tok/s, and int8-ch 116 → ~135–150 tok/s.
   - Prompts: 30–40% faster than the same weights with float compute.
+- **Starting threads was costing ~40% of decode time.** Running each decoded token as one parallel region, with a team of one thread per core, made decode ~40% faster (f16: 100 → 138 tok/s; int4-g32-a16 with integer attention: 167 → 237).
 
 ## Quick start
 
@@ -180,6 +183,7 @@ Timing and model size are printed to stderr after the generated text.
 | `--ppl FILE` | measure perplexity on a text file instead of generating | |
 | `--compare` | with `--ppl`: also run float32 and report agreement, KL, logit differences | off |
 | `--profile` | print time per token by operation (each matmul, attention, KV store, output head, …), for decode and prompt tokens | off |
+| `--threads N` | threads that decode each token together (see [Decode with a thread team](#decode-with-a-thread-team)) | one per core (half the runtime's threads) |
 
 **`--dtype` formats:**
 
@@ -393,8 +397,30 @@ Details of the integer path:
 Other kernels:
 
 - **LayerNorm:** SIMD.
-- **Attention:** multi-head with a KV cache. It runs on one thread for short decode contexts, where waking threads costs more than the work.
+- **Attention:** multi-head with a KV cache, computed by the cache format (`KVCache.attend_one`, per token and head). For prompts, it runs on one thread when there's little work, because waking threads costs more than the work.
 - **GELU and residual adds** are fused into the matmul epilogues.
+
+### Decode with a thread team
+
+Profiling (`--profile`) showed every matmul call paying ~80 µs whatever its size: the cost of starting a parallel region, which wakes the worker threads and waits for all of them. With ~50 regions per token, that was ~40% of decode time. `research/test_barrier.mojo` measured a parallel region at ~23 µs of pure overhead, against ~1 µs for a spin barrier.
+
+So a decoded token now runs as **one** parallel region (`Model.decode`):
+- **A team of threads** (`team.mojo`) goes through every operation of the step together, each doing its share, and they meet at a barrier between operations.
+- **Thread 0** does the small serial pieces: the embedding, LayerNorm, storing the token's key and value.
+- **The shared operations:** the matmuls (`kernels.linear_team`), attention (heads divided among threads), and the output head (`head_team`).
+- **Same arithmetic as before:** the partitioning and summation order match the region-per-operation kernels, so outputs are identical and float32 is still bit-identical.
+- **Prompts keep one region per operation.** Their cost is spread over many tokens.
+
+**Two things mattered for speed:**
+- **One thread per physical core.** With all 8 hyperthreads of a 4-core CPU, waiting threads slow their sibling doing real work on the same core, and the team decode was slower than before. With 4 it's ~40% faster. The default is half the runtime's threads, and `--threads N` overrides it.
+- **Spin, then yield.** The barrier spins briefly, then yields its CPU while waiting. On a busy machine, a team member can be descheduled, and pure spinning would then make the others wait for a whole scheduler time slice.
+
+| Decode tok/s (short / long context) | One region per operation | Team, 8 threads | Team, 4 threads (default) |
+|---|---|---|---|
+| f16 | 100 / 90 | 74 / 65 | 138 / 116 |
+| int4-g32-a16 with `--attention int` | 167 / 152 | 102 / 109 | 237 / 224 |
+
+(3 interleaved rounds with Chrome and Emacs running, load 2–5.)
 
 ## Measuring accuracy
 
@@ -438,18 +464,20 @@ Current results:
 
 ## Performance notes
 
-- **Set `MODULAR_THREAD_BUSY_WAIT_US=0`.** By default, idle Mojo worker threads spin between parallel regions. Decoding runs about 60 short parallel regions per token, and on a 15 W 4-core laptop the spinning threads take cycles and power from the working ones. This setting took float32 decode from ~38 to ~60 tok/s. The runtime reads it at startup, so it must be set in the environment. Machines with more cores may prefer a different value.
+- **Set `MODULAR_THREAD_BUSY_WAIT_US=0`.** By default, idle Mojo worker threads spin between parallel regions. On a 15 W 4-core laptop the spinning threads take cycles and power from the working ones. This setting took float32 decode from ~38 to ~60 tok/s when decoding still used ~60 parallel regions per token. Decoding now uses one region per token, but prompts still use one per operation. The runtime reads it at startup, so it must be set in the environment. Machines with more cores may prefer a different value.
+- **Decode threads:** `--threads N` sets the decode team size. The default, one per physical core, was ~40% faster than using every hyperthread on this CPU.
 - **Benchmark on AC power and interleave runs.** On battery, long-context decode drops to about half. `tests/bench.sh` runs formats in alternating rounds, prints medians, and warns when on battery.
-- **Decode is limited by arithmetic, not memory,** for the quantized formats: ~100 MB per token at ~140 tok/s is ~14 GB/s, against the ~44–55 GB/s the machine can stream. The largest single cost is the output head: 38.6M weights per token.
+- **Decode is still below the memory limit** for the quantized formats: ~90 MB per token at ~235 tok/s is ~21 GB/s, against the ~44–55 GB/s the machine can stream. The next target is the output head, 38.6M weights per token.
 
 ## Project layout
 
 | Path | What |
 |---|---|
-| `gpt2t.mojo` | The model (`Model[W, E]`), loaders for safetensors and GGUF, sampling, evaluation, CLI |
+| `gpt2t.mojo` | The model (`Model[W, E, KV]`, including the team decode), loaders for safetensors and GGUF, sampling, evaluation, profiling, CLI |
 | `tensor.mojo` | The `WeightMatrix` trait, `DenseMatrix`, `QuantMatrix`, `dot_pairs` (VNNI) |
 | `gguf.mojo` | GGUF reader, `GGUFMatrix`, SIMD dequantizers for six block formats |
-| `kernels.mojo` | matmul, GEMV, `matmul_rows`, `matmul_rows_a16`, register tiles, LayerNorm, attention, output head |
+| `kernels.mojo` | matmul, GEMV, `matmul_rows`, `matmul_rows_a16`, register tiles, LayerNorm, attention, output head, and the one-token team kernels `linear_team` / `head_team` |
+| `team.mojo` | `Team`: a spin-then-yield barrier for the threads that decode a token together |
 | `kvcache.mojo` | The `KVCache` / `FloatKV` traits, the float attention, `DenseKV` and `QuantKV` |
 | `int_attention.mojo` | `IntAttnKV`: int8 cache in VNNI layouts, integer attention |
 | `intmath.mojo` | Integer `masked_exp` / `masked_softmax` in fixed point |
@@ -473,7 +501,7 @@ Mojo 1.1 differs a lot from older Mojo, which most online examples use. `PLAN.md
 | M3. float16 / bfloat16, own int8 / int4 with int8 head, GGUF, fast kernels | done |
 | M4. int16 activations with integer VNNI kernels (W4A16 / W8A16) | done |
 | M5. Pluggable KV cache formats matched to the model's precision, and integer attention | done |
-| M6. Tuning: faster output head, fewer thread wake-ups per token | next |
+| M6. Tuning: profiling, one parallel region per decoded token (done, ~40% faster decode); faster output head and a clean results re-run (next) | in progress |
 | M7. Stretch: save pre-quantized weights, int8 activations (VPDPBUSD) | planned |
 
 Open questions (details in `PLAN.md`):

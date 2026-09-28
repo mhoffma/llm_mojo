@@ -115,6 +115,7 @@ Options (both programs; `--dtype` only in `gpt2t`):
 | `--kv FMT` | KV cache format: `auto` (f32/f16/bf16 weights keep their type, quantized weights get `int8`), `f32`, `f16`, `bf16`, `int16`, `int8` | `auto` |
 | `--attention A` | `float`, or `int`: attention in integers (needs the int8 cache) | `float` |
 | `--profile` | print time per token by operation, for decode and prompt tokens | off |
+| `--threads N` | decode team size (capped at the runtime's thread count) | half the runtime's threads (one per core) |
 | `-m DIR` | directory with the Hugging Face files | `gpt2` |
 | `-n N` | tokens to generate | 64 |
 | `-t TEMP` | sampling temperature; `0` = greedy | 0.8 |
@@ -163,6 +164,7 @@ users can install Modular's Mojo extension.
 | `kernels.mojo` | matmul (prefill), GEMV (decode), `matmul_rows` for `[OUT, IN]` weights, LayerNorm, attention, output head; generic over `W: WeightMatrix` |
 | `kvcache.mojo` | The `KVCache` / `FloatKV` traits, float attention (`attend_float`), and `DenseKV[dtype]`, `QuantKV[bits]` |
 | `int_attention.mojo` | `IntAttnKV`: int8 cache in VNNI layouts with integer attention |
+| `team.mojo` | `Team`: spin-then-yield barrier for the decode thread team |
 | `intmath.mojo` | Integer `masked_exp` / `masked_softmax` in fixed point |
 | `tokenizer.mojo` | GPT-2 byte-level BPE tokenizer (reads `vocab.json`, `merges.txt`) |
 | `tests/` | Correctness checks and the accuracy harness's reference (see below); `tests/data/` holds the evaluation text |
@@ -791,6 +793,12 @@ The probes in `research/` (run: `uv run mojo run research/<file>.mojo`):
   Widening costs ~11% when compute-bound; streaming 16-bit weights from memory
   gives ~1.85× the weights/s of float32. For GPT-2-sized weights float16 is
   ~8× more precise than bfloat16.
+
+- **`test_softmax.mojo`**: integer masked softmax (see M5): accurate (KL
+  5.7e-4, Q15) but slower on this CPU than a SIMD float softmax.
+- **`test_barrier.mojo`**: a parallel region costs ~23 µs of overhead, a
+  spin barrier ~1 µs; basis for the M6 team decode (which also needed one
+  thread per core and a spin-then-yield barrier on a busy machine).
 
 Hardware of the development machine (i7-1160G7): 4 cores / 8 threads, one
 512-bit FMA unit per core, 5 MB L2, 12 MB L3, 16 GB RAM, measured ~44–55 GB/s
