@@ -284,3 +284,94 @@ def lm_head_rows[
                 t += 1
 
     parallelize(chunk, nchunks)
+
+
+@always_inline
+def finish[RESID: Bool, GELU: Bool](o: FPtr, i: Int, var r: Float32):
+    """Scalar version of store_out: optional GELU, residual add, store."""
+    comptime if GELU:
+        comptime s = Float32(0.7978845608028654)  # sqrt(2/pi)
+        r = 0.5 * r * (1 + tanh(s * (r + 0.044715 * r * r * r)))
+    comptime if RESID:
+        r += o[unsafe_offset=i]
+    o[unsafe_offset=i] = r
+
+
+def matmul_rows[
+    W: WeightMatrix, //, RESID: Bool = False, GELU: Bool = False, BIAS: Bool = True
+](out_: FPtr, x: FPtr, w: W, b: FPtr, T: Int, IN: Int, OUT: Int):
+    """Computes out[T, OUT] (+)= act(x[T, IN] @ w[OUT, IN]^T + b[OUT]).
+
+    For weights stored one output per row (W.OUT_MAJOR), as GGUF files store
+    them. Threads split the output rows. Each row is dequantized once into a
+    float32 buffer, then dotted with 4 rows of x at a time, so the cost of
+    dequantizing is shared by all T tokens.
+    """
+    comptime RB = 16  # output rows per task
+    var ntasks = (OUT + RB - 1) // RB
+
+    def task(ti: Int) {imm}:
+        var row = unsafe_alloc[Float32](IN)
+        for o in range(ti * RB, min(OUT, (ti + 1) * RB)):
+            w.dequant_row(o, row)
+            var bias = Float32(0)
+            comptime if BIAS:
+                bias = b[unsafe_offset=o]
+            var t = 0
+            while t + 4 <= T:
+                var d0 = F32V(0)
+                var d1 = F32V(0)
+                var d2 = F32V(0)
+                var d3 = F32V(0)
+                var x0 = x.unsafe_offset(t * IN)
+                for i in range(0, IN, NW):
+                    var wv = row.unsafe_load[width=NW](i)
+                    d0 = x0.unsafe_load[width=NW](i).fma(wv, d0)
+                    d1 = x0.unsafe_load[width=NW](IN + i).fma(wv, d1)
+                    d2 = x0.unsafe_load[width=NW](2 * IN + i).fma(wv, d2)
+                    d3 = x0.unsafe_load[width=NW](3 * IN + i).fma(wv, d3)
+                finish[RESID, GELU](out_, t * OUT + o, d0.reduce_add() + bias)
+                finish[RESID, GELU](out_, (t + 1) * OUT + o, d1.reduce_add() + bias)
+                finish[RESID, GELU](out_, (t + 2) * OUT + o, d2.reduce_add() + bias)
+                finish[RESID, GELU](out_, (t + 3) * OUT + o, d3.reduce_add() + bias)
+                t += 4
+            while t < T:
+                var d = F32V(0)
+                var xt = x.unsafe_offset(t * IN)
+                for i in range(0, IN, NW):
+                    d = xt.unsafe_load[width=NW](i).fma(row.unsafe_load[width=NW](i), d)
+                finish[RESID, GELU](out_, t * OUT + o, d.reduce_add() + bias)
+                t += 1
+        row.unsafe_free()
+
+    parallelize(task, ntasks)
+
+
+def linear[
+    W: WeightMatrix, //, RESID: Bool = False, GELU: Bool = False
+](
+    out_: FPtr,
+    x: FPtr,
+    w: W,
+    b: FPtr,
+    T: Int,
+    IN: Int,
+    OUT: Int,
+    scratch: FPtr,
+):
+    """out[T, OUT] (+)= act(x @ w + b), with the kernel for w's layout."""
+    comptime if W.OUT_MAJOR:
+        matmul_rows[RESID=RESID, GELU=GELU](out_, x, w, b, T, IN, OUT)
+    else:
+        matmul[RESID=RESID, GELU=GELU](out_, x, w, b, T, IN, OUT, scratch)
+
+
+def head[W: WeightMatrix, //](logits: FPtr, h: FPtr, w: W, T: Int, V: Int, C: Int):
+    """logits[T, V] = h[T, C] @ w[V, C]^T: the output head, for T rows."""
+    comptime if W.OUT_MAJOR:
+        matmul_rows[BIAS=False](logits, h, w, h, T, C, V)
+    else:
+        if T == 1:
+            lm_head(logits, h, w, V, C)
+        else:
+            lm_head_rows(logits, h, w, T, V, C)

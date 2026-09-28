@@ -9,13 +9,20 @@ Usage:
     mojo run gpt2t.mojo [--dtype FMT] [-m DIR] [-n TOKENS] [-t TEMP] [-k TOPK]
                         [-s SEED] [-v] "prompt"
 
-    --dtype FMT  weight format: f32 (default), f16, bf16
+    --dtype FMT  weight format: f32 (default), f16, bf16, or quantized
+                 int8-ch, int4-ch, int4-g128, int4-g64, int4-g32, each
+                 also with a -sym suffix (see tensor.mojo QuantMatrix)
     -m DIR       directory with the Hugging Face GPT-2 files (default: gpt2)
     -n TOKENS    number of tokens to generate (default: 64)
     -t TEMP      sampling temperature; 0 = greedy (default: 0.8)
     -k TOPK      sample from the TOPK most likely tokens; 0 = all (default: 40)
     -s SEED      random seed (default: 1337)
     -v           print prompt token ids and the top-5 next-token logits
+    --gguf FILE  use the weights in a llama.cpp GGUF file of GPT-2 124M
+                 (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 tensors), as
+                 stored; overrides --dtype. The tokenizer still comes from -m.
+    --ppl FILE   measure perplexity on a text file instead of generating
+    --compare    with --ppl: also run float32 and compare predictions
 
 Which tensors use the format: the four matrices in each layer (qkv, attention
 projection, MLP up and down) and wte, the token embedding that doubles as the
@@ -30,16 +37,10 @@ from std.math import exp, log
 from std.io import FileDescriptor
 from std.os import SEEK_END, SEEK_SET
 
-from tensor import FPtr, NW, F32V, WeightMatrix, DenseMatrix
+from tensor import FPtr, NW, F32V, WeightMatrix, DenseMatrix, QuantMatrix
 from max.algorithm import parallelize
-from kernels import (
-    matmul,
-    layernorm,
-    attention,
-    lm_head,
-    lm_head_rows,
-    MAX_PARTS,
-)
+from kernels import linear, head, layernorm, attention, MAX_PARTS
+from gguf import GGUFFile, GGUFMatrix, BPtr, GGML_F32, type_name
 from tokenizer import Tokenizer, parse_uint, read_file_bytes
 
 # GPT-2 small hyperparameters.
@@ -136,10 +137,17 @@ def read_safetensors(path: String, mut header: String) raises -> FPtr:
 
 
 struct Model[W: WeightMatrix](Movable):
-    """GPT-2 with its large matrices stored in format W."""
+    """GPT-2 with its large matrices stored in format W.
 
-    var wte: Self.W  # [V, C] token embedding, also the output head
+    Build one with `load_model` (Hugging Face safetensors, converted to W) or
+    `load_gguf` (a llama.cpp GGUF file, used as stored).
+    """
+
+    var wte: Self.W  # [V, C] token embedding
+    var lm: Self.W  # [V, C] output head: the same handle as wte when tied
+    var tied: Bool
     var mats: List[Self.W]  # N_LAYER * N_MATS layer matrices
+    var file: BPtr  # file buffer the matrices point into (GGUF), or unused
     var small: FPtr  # all float32 parameters, in one buffer:
     var vecs: List[FPtr]  #   N_LAYER * N_VECS pointers into small
     var wpe: FPtr  #   [MAX_T, C] position embedding
@@ -156,44 +164,35 @@ struct Model[W: WeightMatrix](Movable):
     var vcache: FPtr
     var scratch: FPtr  # gemv partial sums
 
-    def __init__(out self, path: String) raises:
-        """Loads float32 weights, converts the large ones to W, and frees
-        the float32 copy."""
-        var header = String()
-        var params = read_safetensors(path, header)
-
-        self.wte = Self.W.from_f32(tensor(header, params, "wte.weight"), V, C)
-        self.mats = List[Self.W](capacity=N_LAYER * N_MATS)
-        for l in range(N_LAYER):
-            comptime for m in range(N_MATS):
-                comptime name = MAT_NAMES[m]
-                comptime rows = MAT_ROWS[m]
-                comptime cols = MAT_COLS[m]
-                var src = tensor(header, params, "h." + String(l) + "." + name)
-                self.mats.append(Self.W.from_f32(src, rows, cols))
-
-        # Copy the small float32 tensors out, so the payload can be freed.
-        self.small = unsafe_alloc[Float32](
-            N_LAYER * LAYER_VEC_FLOATS + MAX_T * C + 2 * C
-        )
+    def __init__(
+        out self,
+        wte: Self.W,
+        lm: Self.W,
+        tied: Bool,
+        var mats: List[Self.W],
+        small_src: List[FPtr],
+        file: BPtr,
+    ):
+        """Takes the matrices, copies the small float32 tensors (listed in
+        SMALL_ORDER) into one buffer, and allocates the activations."""
+        self.wte = wte
+        self.lm = lm
+        self.tied = tied
+        self.mats = mats^
+        self.file = file
+        self.small = unsafe_alloc[Float32](SMALL_FLOATS)
         var off = 0
         self.vecs = List[FPtr](capacity=N_LAYER * N_VECS)
         for l in range(N_LAYER):
             comptime for s in range(N_VECS):
-                comptime name = VEC_NAMES[s]
                 comptime n = VEC_LENS[s]
-                var src = tensor(header, params, "h." + String(l) + "." + name)
-                self.vecs.append(copy_into(self.small, off, src, n))
-        self.wpe = copy_into(
-            self.small, off, tensor(header, params, "wpe.weight"), MAX_T * C
-        )
-        self.lnf_w = copy_into(
-            self.small, off, tensor(header, params, "ln_f.weight"), C
-        )
-        self.lnf_b = copy_into(
-            self.small, off, tensor(header, params, "ln_f.bias"), C
-        )
-        params.unsafe_free()
+                self.vecs.append(
+                    copy_into(self.small, off, small_src[l * N_VECS + s], n)
+                )
+        var k = N_LAYER * N_VECS
+        self.wpe = copy_into(self.small, off, small_src[k], MAX_T * C)
+        self.lnf_w = copy_into(self.small, off, small_src[k + 1], C)
+        self.lnf_b = copy_into(self.small, off, small_src[k + 2], C)
 
         self.x = unsafe_alloc[Float32](MAX_T * C)
         self.xn = unsafe_alloc[Float32](MAX_T * C)
@@ -207,8 +206,11 @@ struct Model[W: WeightMatrix](Movable):
 
     def __deinit__(deinit self):
         self.wte.free()
+        if not self.tied:
+            self.lm.free()
         for m in self.mats:
             m.free()
+        self.file.unsafe_free()
         self.small.unsafe_free()
         self.x.unsafe_free()
         self.xn.unsafe_free()
@@ -223,9 +225,11 @@ struct Model[W: WeightMatrix](Movable):
     def weight_bytes(self) -> Int:
         """Bytes of all parameters, as stored."""
         var n = self.wte.nbytes()
+        if not self.tied:
+            n += self.lm.nbytes()
         for m in self.mats:
             n += m.nbytes()
-        return n + (N_LAYER * LAYER_VEC_FLOATS + MAX_T * C + 2 * C) * 4
+        return n + SMALL_FLOATS * 4
 
     def forward(self, tokens: List[Int], pos0: Int) -> FPtr:
         """Runs tokens at positions pos0.. and returns the last token's logits.
@@ -233,7 +237,7 @@ struct Model[W: WeightMatrix](Movable):
         self.blocks(tokens, pos0)
         var last = self.x.unsafe_offset((len(tokens) - 1) * C)
         layernorm[C](self.xn, last, self.lnf_w, self.lnf_b, 1)
-        lm_head(self.logits, self.xn, self.wte, V, C)
+        head(self.logits, self.xn, self.lm, 1, V, C)
         return self.logits
 
     def forward_all(self, tokens: List[Int], logits: FPtr):
@@ -242,7 +246,7 @@ struct Model[W: WeightMatrix](Movable):
         var T = len(tokens)
         self.blocks(tokens, 0)
         layernorm[C](self.xn, self.x, self.lnf_w, self.lnf_b, T)
-        lm_head_rows(logits, self.xn, self.wte, T, V, C)
+        head(logits, self.xn, self.lm, T, V, C)
 
     def blocks(self, tokens: List[Int], pos0: Int):
         """Embeds tokens at positions pos0.. and runs all transformer blocks,
@@ -253,11 +257,11 @@ struct Model[W: WeightMatrix](Movable):
         var qkv = self.qkv
         for t in range(T):
             var p = self.wpe.unsafe_offset((pos0 + t) * C)
+            var xt = x.unsafe_offset(t * C)
+            self.wte.dequant_row(tokens[t], xt)
             for i in range(0, C, NW):
-                x.unsafe_store(
-                    t * C + i,
-                    self.wte.load[NW](tokens[t], i)
-                    + p.unsafe_load[width=NW](i),
+                xt.unsafe_store(
+                    i, xt.unsafe_load[width=NW](i) + p.unsafe_load[width=NW](i)
                 )
 
         for l in range(N_LAYER):
@@ -269,7 +273,7 @@ struct Model[W: WeightMatrix](Movable):
             layernorm[C](
                 xn, x, v[unsafe_offset=LN1_W], v[unsafe_offset=LN1_B], T
             )
-            matmul(
+            linear(
                 qkv,
                 xn,
                 m[unsafe_offset=QKV],
@@ -288,7 +292,7 @@ struct Model[W: WeightMatrix](Movable):
                         dst + i, row.unsafe_load[width=NW](2 * C + i)
                     )
             attention[N_HEAD, HS](self.att, qkv, kc, vc, T, pos0)
-            matmul[RESID=True](
+            linear[RESID=True](
                 x,
                 self.att,
                 m[unsafe_offset=PROJ],
@@ -302,7 +306,7 @@ struct Model[W: WeightMatrix](Movable):
             layernorm[C](
                 xn, x, v[unsafe_offset=LN2_W], v[unsafe_offset=LN2_B], T
             )
-            matmul[GELU=True](
+            linear[GELU=True](
                 self.fc,
                 xn,
                 m[unsafe_offset=FC],
@@ -312,7 +316,7 @@ struct Model[W: WeightMatrix](Movable):
                 4 * C,
                 self.scratch,
             )
-            matmul[RESID=True](
+            linear[RESID=True](
                 x,
                 self.fc,
                 m[unsafe_offset=FCPROJ],
@@ -322,6 +326,98 @@ struct Model[W: WeightMatrix](Movable):
                 C,
                 self.scratch,
             )
+
+
+# The small float32 tensors, in the order Model's constructor takes them:
+# N_VECS per layer, then wpe, ln_f.weight, ln_f.bias.
+comptime SMALL_FLOATS = N_LAYER * LAYER_VEC_FLOATS + MAX_T * C + 2 * C
+
+
+def load_model[W: WeightMatrix](path: String) raises -> Model[W]:
+    """Loads Hugging Face float32 safetensors and converts the large
+    matrices to W. The output head is tied to wte."""
+    var header = String()
+    var params = read_safetensors(path, header)
+    var wte = W.from_f32(
+        tensor(header, params, "wte.weight"), V, C, reduce_rows=False
+    )
+    var mats = List[W](capacity=N_LAYER * N_MATS)
+    var small = List[FPtr]()
+    for l in range(N_LAYER):
+        var prefix = "h." + String(l) + "."
+        comptime for m in range(N_MATS):
+            comptime name = MAT_NAMES[m]
+            comptime rows = MAT_ROWS[m]
+            comptime cols = MAT_COLS[m]
+            var src = tensor(header, params, prefix + name)
+            mats.append(W.from_f32(src, rows, cols, reduce_rows=True))
+        comptime for s in range(N_VECS):
+            comptime name = VEC_NAMES[s]
+            small.append(tensor(header, params, prefix + name))
+    small.append(tensor(header, params, "wpe.weight"))
+    small.append(tensor(header, params, "ln_f.weight"))
+    small.append(tensor(header, params, "ln_f.bias"))
+    var model = Model[W](wte, wte, True, mats^, small, unsafe_alloc[UInt8](1))
+    params.unsafe_free()  # the model copied what it keeps
+    return model^
+
+
+# GGUF names for MAT_NAMES and VEC_NAMES (llama.cpp's GPT-2 conversion).
+comptime GGUF_MAT_NAMES = [
+    "attn_qkv.weight",
+    "attn_output.weight",
+    "ffn_up.weight",
+    "ffn_down.weight",
+]
+comptime GGUF_VEC_NAMES = [
+    "attn_norm.weight",
+    "attn_norm.bias",
+    "attn_qkv.bias",
+    "attn_output.bias",
+    "ffn_norm.weight",
+    "ffn_norm.bias",
+    "ffn_up.bias",
+    "ffn_down.bias",
+]
+
+
+def gguf_f32(g: GGUFFile, name: String) raises -> FPtr:
+    """A float32 tensor of a GGUF file, in place."""
+    var m = g.matrix(name)
+    if m.kind != GGML_F32:
+        raise Error(name + " is " + type_name(m.kind) + ", expected F32")
+    return m.data.unsafe_bitcast[Float32]()
+
+
+def load_gguf(path: String) raises -> Model[GGUFMatrix]:
+    """Loads a llama.cpp GGUF file of GPT-2 124M, using its matrices as
+    stored (quantized), without converting them."""
+    var g = GGUFFile(path)
+    var wte = g.matrix("token_embd.weight")
+    var tied = not g.has("output.weight")
+    var lm = wte if tied else g.matrix("output.weight")
+    var mats = List[GGUFMatrix](capacity=N_LAYER * N_MATS)
+    var small = List[FPtr]()
+    for l in range(N_LAYER):
+        var prefix = "blk." + String(l) + "."
+        comptime for m in range(N_MATS):
+            comptime name = GGUF_MAT_NAMES[m]
+            comptime rows = MAT_COLS[m]  # GGUF stores [OUT, IN]
+            comptime cols = MAT_ROWS[m]
+            var mat = g.matrix(prefix + name)
+            if mat.rows != rows or mat.cols != cols:
+                raise Error(prefix + name + " has an unexpected shape")
+            mats.append(mat)
+        comptime for s in range(N_VECS):
+            comptime name = GGUF_VEC_NAMES[s]
+            small.append(gguf_f32(g, prefix + name))
+    small.append(gguf_f32(g, "position_embd.weight"))
+    small.append(gguf_f32(g, "output_norm.weight"))
+    small.append(gguf_f32(g, "output_norm.bias"))
+    if wte.rows != V or wte.cols != C:
+        raise Error("token_embd.weight has an unexpected shape")
+    # The model takes over the file buffer: the matrices point into it.
+    return Model[GGUFMatrix](wte, lm, tied, mats^, small, g^.release())
 
 
 def copy_into(dst: FPtr, mut off: Int, src: FPtr, n: Int) -> FPtr:
@@ -414,6 +510,7 @@ struct Args(Movable):
     var prompt: String
     var ppl: String  # evaluation text file; empty = generate instead
     var compare: Bool  # with ppl: also compare against float32
+    var gguf: String  # GGUF weights file; overrides --dtype
 
     def __init__(out self) raises:
         self.dtype = "f32"
@@ -426,6 +523,7 @@ struct Args(Movable):
         self.prompt = "The meaning of life is"
         self.ppl = ""
         self.compare = False
+        self.gguf = ""
         var args = argv()
         var a = 1
         while a < len(args):
@@ -440,6 +538,8 @@ struct Args(Movable):
                     self.dtype = val
                 elif arg == "--ppl":
                     self.ppl = val
+                elif arg == "--gguf":
+                    self.gguf = val
                 elif arg == "-m":
                     self.dir = val
                 elif arg == "-n":
@@ -461,7 +561,7 @@ struct Args(Movable):
 def generate[W: WeightMatrix](args: Args) raises:
     """Loads the model with weights in format W and generates text."""
     var t_load = perf_counter_ns()
-    var model = Model[W](args.dir + "/model.safetensors")
+    var model = load[W](args)
     var tok = Tokenizer(args.dir)
     var load_ms = Float64(perf_counter_ns() - t_load) / 1e6
 
@@ -511,7 +611,7 @@ def generate[W: WeightMatrix](args: Args) raises:
     print("\n---", file=FileDescriptor(2))
     print(
         "dtype",
-        W.NAME,
+        W.name(),
         "|",
         model.weight_bytes() // (1024 * 1024),
         "MB | load",
@@ -677,12 +777,12 @@ def eval_loop[
         name, ":", scored, "tokens scored in", windows, "windows of",
         EVAL_WINDOW, "(stride", EVAL_STRIDE, ") in", secs, "s",
     )
-    print("  ", W.NAME, "perplexity", ppl, " mean NLL", totals[NLL] / cnt, "nats")
+    print("  ", W.name(), "perplexity", ppl, " mean NLL", totals[NLL] / cnt, "nats")
     comptime if COMPARE:
         var ppl_b = exp(totals[NLL_BASE] / cnt)
         print("   f32 perplexity", ppl_b, " change", (ppl / ppl_b - 1) * 100, "%")
         print("   top-1 agreement with f32:", totals[AGREE] / cnt * 100, "%")
-        print("   mean KL(f32 || ", W.NAME, "):", totals[KL] / cnt, "nats")
+        print("   mean KL(f32 || ", W.name(), "):", totals[KL] / cnt, "nats")
         print(
             "   logit |diff| vs f32: mean", totals[DIFF_SUM] / (cnt * V),
             " max", diff_max,
@@ -700,14 +800,23 @@ def evaluate[W: WeightMatrix](args: Args) raises:
     var ids = tok.encode(text)
     if len(ids) < 2:
         raise Error("need at least 2 tokens in " + args.ppl)
-    var path = args.dir + "/model.safetensors"
-    var model = Model[W](path)
+    var model = load[W](args)
     if args.compare:
-        var base = Model[F32](path)
+        var base = load_model[F32](args.dir + "/model.safetensors")
         eval_loop[W, F32, True](model, base, ids, args.ppl)
     else:
         # Without COMPARE the baseline is never used; pass model itself.
         eval_loop[W, W, False](model, model, ids, args.ppl)
+
+
+def load[W: WeightMatrix](args: Args) raises -> Model[W]:
+    """Loads the model for format W: from --gguf for GGUF, otherwise from
+    the Hugging Face safetensors, converted to W."""
+    comptime if W.OUT_MAJOR:
+        # W is GGUFMatrix here; rebind_var tells the compiler so.
+        return rebind_var[Model[W]](load_gguf(args.gguf))
+    else:
+        return load_model[W](args.dir + "/model.safetensors")
 
 
 def run[W: WeightMatrix](args: Args) raises:
@@ -719,6 +828,9 @@ def run[W: WeightMatrix](args: Args) raises:
 
 def main() raises:
     var args = Args()
+    if args.gguf.byte_length() > 0:
+        run[GGUFMatrix](args)
+        return
     # Each branch instantiates the whole program for one format, at compile
     # time. Adding a format is one more line here.
     if args.dtype == "f32":
@@ -727,7 +839,25 @@ def main() raises:
         run[DenseMatrix[DType.float16]](args)
     elif args.dtype == "bf16":
         run[DenseMatrix[DType.bfloat16]](args)
+    elif args.dtype == "int8-ch":
+        run[QuantMatrix[8, 0, False]](args)
+    elif args.dtype == "int8-ch-sym":
+        run[QuantMatrix[8, 0, True]](args)
+    elif args.dtype == "int4-ch":
+        run[QuantMatrix[4, 0, False]](args)
+    elif args.dtype == "int4-ch-sym":
+        run[QuantMatrix[4, 0, True]](args)
+    elif args.dtype == "int4-g128":
+        run[QuantMatrix[4, 128, False]](args)
+    elif args.dtype == "int4-g128-sym":
+        run[QuantMatrix[4, 128, True]](args)
+    elif args.dtype == "int4-g64":
+        run[QuantMatrix[4, 64, False]](args)
+    elif args.dtype == "int4-g64-sym":
+        run[QuantMatrix[4, 64, True]](args)
+    elif args.dtype == "int4-g32":
+        run[QuantMatrix[4, 32, False]](args)
+    elif args.dtype == "int4-g32-sym":
+        run[QuantMatrix[4, 32, True]](args)
     else:
-        raise Error(
-            "unknown --dtype " + args.dtype + " (supported: f32, f16, bf16)"
-        )
+        raise Error("unknown --dtype " + args.dtype + " (see --help in PLAN.md)")

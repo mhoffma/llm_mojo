@@ -49,7 +49,7 @@ accuracy each format costs for that speed**.
 | Probes: VNNI, float16/bfloat16 | ✅ done (`research/`) |
 | M1. Generic weight formats, float32 bit-identical to baseline | ✅ done |
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
-| M3. float16 / bfloat16, then int4 (and int8) weights with float32 compute | 🔄 f16/bf16 done; int4/int8 next |
+| M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | 🔄 f16/bf16, own int8/int4, GGUF loading done (accuracy verified); fast GGUF kernels next |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ☐ |
 | M5. Tuning and final results table | ☐ |
 | M6. Stretch: pre-quantized weight files, int8 activations | ☐ |
@@ -78,7 +78,18 @@ mkdir -p gpt2
 for f in model.safetensors vocab.json merges.txt; do
   curl -L -o gpt2/$f https://huggingface.co/openai-community/gpt2/resolve/main/$f
 done
+
+# Pre-quantized llama.cpp GGUF files of the same model (~100-180 MB each)
+mkdir -p gpt2/gguf
+curl -L -o gpt2/gguf/gpt2.Q4_K_M.gguf https://huggingface.co/mradermacher/gpt2-GGUF/resolve/main/gpt2.Q4_K_M.gguf
+curl -L -o gpt2/gguf/gpt2.i1-Q4_K_M.gguf https://huggingface.co/mradermacher/gpt2-i1-GGUF/resolve/main/gpt2.i1-Q4_K_M.gguf
+for q in Q4_0 Q4_1 Q8_0; do
+  curl -L -o gpt2/gguf/gpt2.$q.gguf https://huggingface.co/QuantFactory/gpt2-GGUF/resolve/main/gpt2.$q.gguf
+done
 ```
+
+(If you script downloads in zsh, note it does not word-split unquoted
+variables; `set -- $f` style loops need bash.)
 
 Why the `max` package: in Mojo 1.1, `parallelize` moved out of the standard
 library into `max.algorithm`. The `mojo` and `max` versions must match;
@@ -98,13 +109,14 @@ Options (both programs; `--dtype` only in `gpt2t`):
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--dtype FMT` | weight format: `f32`, `f16`, `bf16` (more per milestone) | `f32` |
+| `--dtype FMT` | weight format: `f32`, `f16`, `bf16`, `int8-ch`, `int4-ch`, `int4-g128`, `int4-g64`, `int4-g32`, each int format also with `-sym` | `f32` |
 | `-m DIR` | directory with the Hugging Face files | `gpt2` |
 | `-n N` | tokens to generate | 64 |
 | `-t TEMP` | sampling temperature; `0` = greedy | 0.8 |
 | `-k K` | top-k sampling; `0` = all tokens | 40 |
 | `-s SEED` | random seed | 1337 |
 | `-v` | print prompt token ids and the top-5 next-token logits | off |
+| `--gguf FILE` | use a llama.cpp GGUF file's weights as stored (overrides `--dtype`; `gpt2t` only) | |
 | `--ppl FILE` | instead of generating, measure perplexity on a text file (`gpt2t` only) | |
 | `--compare` | with `--ppl`: also run float32 and compare predictions (`gpt2t` only) | off |
 
@@ -140,8 +152,9 @@ users can install Modular's Mojo extension.
 |---|---|
 | `gpt2.mojo` | **Frozen float32 baseline.** Single file, known correct. Don't change it; it's the reference the generic version is tested against. |
 | `gpt2t.mojo` | The generic version: `Model[W]`, sampling, CLI, and `main`, which picks the format from `--dtype` |
-| `tensor.mojo` | The `WeightMatrix` trait and the formats (`DenseMatrix[dtype]` so far) |
-| `kernels.mojo` | matmul (prefill), GEMV (decode), LayerNorm, attention, output head; generic over `W: WeightMatrix` |
+| `tensor.mojo` | The `WeightMatrix` trait and our formats: `DenseMatrix[dtype]`, `QuantMatrix[bits, group, symmetric]` |
+| `gguf.mojo` | GGUF file reader and `GGUFMatrix`: dequantizes Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 |
+| `kernels.mojo` | matmul (prefill), GEMV (decode), `matmul_rows` for `[OUT, IN]` weights, LayerNorm, attention, output head; generic over `W: WeightMatrix` |
 | `tokenizer.mojo` | GPT-2 byte-level BPE tokenizer (reads `vocab.json`, `merges.txt`) |
 | `tests/` | Correctness checks and the accuracy harness's reference (see below); `tests/data/` holds the evaluation text |
 | `research/` | Small commented probe programs, each answering one question; see `research/README.md` |
@@ -158,6 +171,9 @@ users can install Modular's Mojo extension.
 | Greedy decoding (KV cache path) matches NumPy | `uv run --with tiktoken python tests/reference.py greedy <ids> 30` vs `./gpt2t_bin -t 0 -n 30 "<prompt>"` | identical text |
 | Tokenizer matches tiktoken | `uv run --with tiktoken python tests/tokenizer_vs_tiktoken.py` | `mismatches: 0` |
 | Perplexity matches NumPy | `uv run --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt` vs `./gpt2t_bin --ppl tests/data/alice_ch1.txt` | same to ~6 digits (25.2843) |
+| Our quantizer matches NumPy | add `--quant 4,32,0` (bits, group, symmetric) to the reference; compare with `--dtype int4-g32` | same to ~6 digits |
+| GGUF dequantization matches llama.cpp's Python `gguf` | `uv run --with gguf python tests/gguf_check.py gpt2/gguf/gpt2.Q4_K_M.gguf` (runs `tests/gguf_dump.mojo`) | relative error ≤ 1e-5 (measured ~4e-8 for all six block formats) |
+| GGUF perplexity matches NumPy | `uv run --with gguf --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --gguf FILE` vs `./gpt2t_bin --gguf FILE --ppl tests/data/alice_ch1.txt` | same to ~6 digits |
 
 Build both binaries before running these. Run `tests/same_as_baseline.sh`
 after any change to `gpt2t.mojo`, `kernels.mojo`, or `tensor.mojo`: float32
@@ -265,7 +281,30 @@ Possible later improvement: cache float32's logits (or per-position
 statistics) so `--compare` doesn't recompute the baseline for every format
 in a sweep.
 
-### M3. 16-bit, then int4 / int8 weights (float32 compute)
+### M3. 16-bit, int8/int4, and GGUF weights (float32 compute)
+
+**Status and findings so far:**
+
+- f16 / bf16: done (see [Results](#results)).
+- Our own int8/int4 (`QuantMatrix`, `--dtype int...`): implemented and
+  verified against NumPy (`tests/reference.py --quant`), but accuracy is poor:
+  int8 per-channel +4% perplexity, int4 group 32 perplexity 259. The cause is
+  the output head: we quantize the tied `wte` together with everything else,
+  while llama.cpp keeps GPT-2's output head at 6-bit (Q6_K). GGUF Q4_0, whose
+  layer matrices use nearly our `int4-g32-sym` scheme, reaches 27.2 with its
+  6-bit head. Next for our formats: keep the head at int8/f16 (a separate
+  format for `lm`, which Model already has as its own field).
+- **GGUF** (`--gguf FILE`, gguf.mojo): pre-quantized GPT-2 124M files from
+  Hugging Face, used as stored. GGUF keeps matrices as `[OUT, IN]` with
+  blocks along the input axis, so they use `matmul_rows` (dequantize a row,
+  then dot it with every token). The format is chosen per tensor at runtime
+  because Q4_K_M mixes Q4_K, Q5_K and Q6_K. Dequantization and perplexity
+  match llama.cpp's Python package and NumPy. **Q4_K_M: perplexity +0.7%.**
+- GGUF speed is not optimized yet: rows are dequantized one scalar at a time,
+  on every token, so decode runs at ~8–20 tok/s. Next: SIMD dequantization
+  fused with the dot product, per block format, so decode can beat f16.
+
+**Original plan for our own formats (kept for reference):**
 
 1. float16 and bfloat16: add `DenseMatrix[DType.float16]` and
    `DenseMatrix[DType.bfloat16]` branches in `main`. Measure.
@@ -418,15 +457,26 @@ Notes on f16 / bf16:
 | f32 (`gpt2t`) | 474 MB | same | same | 25.284 | 100% (bit-identical) | 0 |
 | f16 | 239 MB | 504–562 | 64–77 / 59–65 | 25.302 (+0.07%) | 99.67% | 1.7e-5 |
 | bf16 | 239 MB | 603–613 | 78–82 / 67–69 | 25.073 (−0.84%) | 95.13% | 7.4e-3 |
-| int8, per-channel | | | | | | |
-| int4, per-channel | | | | | | |
-| int4, group 128 | | | | | | |
-| int4, group 64 | | | | | | |
-| int4, group 32 | | | | | | |
+| int8, per-channel (ours, head int8 too) | 121 MB | | | 26.284 (+3.95%) | 85.0% | 3.7e-2 |
+| int4, per-channel (ours, head int4) | 62 MB | | | | | |
+| int4, group 128 (ours, head int4) | | | | | | |
+| int4, group 64 (ours, head int4) | | | | | | |
+| int4, group 32 (ours, head int4) | 77 MB | | | 258.7 (+923%) | 25.5% | 2.4 |
+| GGUF Q8_0 (head Q6_K) | 167 MB | unoptimized | unoptimized | 25.416 (+0.52%) | 91.1% | 1.2e-2 |
+| GGUF Q4_0 (head Q6_K) | 99 MB | unoptimized | unoptimized | 27.178 (+7.49%) | 74.6% | 1.7e-1 |
+| GGUF Q4_K_M (Q4_K/Q5_K/Q6_K, head Q6_K) | 105 MB | unoptimized | unoptimized | 25.460 (+0.70%) | 80.2% | 9.8e-2 |
+| GGUF i1-Q4_K_M (NumPy only so far) | 105 MB | | | 27.615 (+9.2%) | | |
 | W4A16 (best int4 config) | | | | | | |
 
 ## Open questions
 
+- Q4_K_M changes perplexity by only 0.7% but agrees with float32's top-1 at
+  only 80% of positions (KL 0.098), and even Q8_0 agrees at only 91%. GPT-2
+  small is known to be sensitive to quantization; is top-1 agreement on this
+  text dominated by near-ties? A second evaluation text would help.
+- The imatrix file (i1-Q4_K_M) scores worse than plain Q4_K_M here (+9.2% vs
+  +0.7%). Probably its importance data came from different text; one 3.3K
+  token text can't settle it.
 - Is per-channel int4 accurate enough for GPT-2 124M, or are groups needed?
   (M3 sweep)
 - Can `wte` (embedding + output head) go to int4, or does it need int8 or

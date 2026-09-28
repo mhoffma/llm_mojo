@@ -12,6 +12,19 @@ Usage (from ~/fun):
         perplexity of a text file, with the same sliding windows as
         `gpt2t_bin --ppl` (1024 tokens, stride 512, each token scored once)
 
+Add --quant BITS,GROUP,SYM (e.g. --quant 4,32,0) to any mode to fake-quantize
+the same matrices gpt2t quantizes (the four per-layer matrices and wte) with
+the same scheme as tensor.mojo's QuantMatrix: round-to-nearest, float16 scale
+and min per group along the reduction axis, GROUP 0 = per-channel, SYM 1 =
+symmetric. Use it to check `gpt2t_bin --dtype int...` independently.
+
+Add --gguf FILE to any mode to take the weights from a llama.cpp GGUF file
+instead (dequantized to float32 with the `gguf` package, so add
+`--with gguf` to uv run). GGUF stores GPT-2's output head as a separate
+tensor (output.weight), which is used in place of the tied wte.
+Add --quant-only NAME (e.g. mlp.c_proj, or wte) to quantize only the matrices
+whose name ends with NAME, to find which ones lose the most accuracy.
+
 Get token ids for a prompt with:  ./gpt2t_bin -v -n 0 "your prompt"
 """
 
@@ -29,12 +42,75 @@ with open(MODEL, "rb") as f:
     HEADER = json.loads(f.read(n))
 BASE = 8 + n
 BUF = np.memmap(MODEL, dtype=np.uint8, mode="r")
+QUANT = None  # (bits, group, symmetric) when --quant is given
+QUANTIZED = ("attn.c_attn.weight", "attn.c_proj.weight", "mlp.c_fc.weight",
+             "mlp.c_proj.weight", "wte.weight")
+_cache = {}
+GGUF = None  # a gguf.GGUFReader when --gguf is given
+
+
+def gguf_name(name):
+    """Maps a Hugging Face GPT-2 tensor name to its llama.cpp GGUF name."""
+    fixed = {"wte.weight": "token_embd.weight", "wpe.weight": "position_embd.weight",
+             "ln_f.weight": "output_norm.weight", "ln_f.bias": "output_norm.bias",
+             "lm_head": "output.weight"}
+    if name in fixed:
+        return fixed[name]
+    _, layer, rest = name.split(".", 2)
+    parts = {"ln_1": "attn_norm", "attn.c_attn": "attn_qkv", "attn.c_proj": "attn_output",
+             "ln_2": "ffn_norm", "mlp.c_fc": "ffn_up", "mlp.c_proj": "ffn_down"}
+    module, kind = rest.rsplit(".", 1)
+    return f"blk.{layer}.{parts[module]}.{kind}"
+
+
+def t_gguf(name):
+    from gguf.quants import dequantize
+
+    want = gguf_name(name)
+    tensor = next((x for x in GGUF.tensors if x.name == want), None)
+    if tensor is None and name == "lm_head":  # tied: no separate output head
+        return t("wte.weight")
+    w = dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
+    w = w.reshape([int(d) for d in reversed(tensor.shape)])
+    # GGUF stores layer matrices as [OUT, IN]; Hugging Face's Conv1D is [IN, OUT].
+    if w.ndim == 2 and name.startswith("h.") and name.endswith(".weight"):
+        w = w.T
+    return w
+
+
+def fake_quant(w, bits, group, sym, reduce_rows):
+    """Quantizes and dequantizes w like tensor.mojo's QuantMatrix."""
+    W = w if reduce_rows else w.T  # put the reduction axis first
+    rows, cols = W.shape
+    g = rows if group == 0 else group
+    Wg = W.reshape(rows // g, g, cols)
+    if sym:
+        s = np.abs(Wg).max(axis=1) / (2 ** (bits - 1) - 1)
+        mn = -(2 ** (bits - 1)) * s
+    else:
+        lo, hi = Wg.min(axis=1), Wg.max(axis=1)
+        s = (hi - lo) / (2**bits - 1)
+        mn = lo
+    s = np.where(s == 0, 1, s).astype(np.float16).astype(np.float32)[:, None, :]
+    mn = mn.astype(np.float16).astype(np.float32)[:, None, :]
+    u = np.clip(np.round((Wg - mn) / s), 0, 2**bits - 1)
+    out = (u * s + mn).reshape(rows, cols).astype(np.float32)
+    return out if reduce_rows else out.T
 
 
 def t(name):
+    if name in _cache:
+        return _cache[name]
+    if GGUF is not None:
+        _cache[name] = t_gguf(name)
+        return _cache[name]
     m = HEADER[name]
     a, b = m["data_offsets"]
-    return np.frombuffer(BUF[BASE + a : BASE + b], dtype=np.float32).reshape(m["shape"])
+    w = np.frombuffer(BUF[BASE + a : BASE + b], dtype=np.float32).reshape(m["shape"])
+    if QUANT and name.endswith(QUANTIZED):
+        w = fake_quant(w, *QUANT, reduce_rows=(name != "wte.weight"))
+        _cache[name] = w
+    return w
 
 
 def ln(x, w, b):
@@ -67,7 +143,8 @@ def forward(toks, all_positions=False):
         m = gelu(h + t(p + "mlp.c_fc.bias"))
         x = x + m @ t(p + "mlp.c_proj.weight") + t(p + "mlp.c_proj.bias")
     x = ln(x, t("ln_f.weight"), t("ln_f.bias"))
-    return (x if all_positions else x[-1]) @ t("wte.weight").T
+    head = t("lm_head") if GGUF is not None else t("wte.weight")
+    return (x if all_positions else x[-1]) @ head.T
 
 
 def perplexity(ids, window=1024, stride=512):
@@ -89,6 +166,23 @@ def perplexity(ids, window=1024, stride=512):
 
 
 def main():
+    global QUANT, GGUF
+    if "--gguf" in sys.argv:
+        from gguf import GGUFReader
+
+        i = sys.argv.index("--gguf")
+        GGUF = GGUFReader(sys.argv[i + 1])
+        del sys.argv[i : i + 2]
+    if "--quant" in sys.argv:
+        i = sys.argv.index("--quant")
+        bits, group, sym = (int(v) for v in sys.argv[i + 1].split(","))
+        QUANT = (bits, group, bool(sym))
+        del sys.argv[i : i + 2]
+    if "--quant-only" in sys.argv:
+        global QUANTIZED
+        i = sys.argv.index("--quant-only")
+        QUANTIZED = tuple(q for q in QUANTIZED if q.startswith(sys.argv[i + 1]))
+        del sys.argv[i : i + 2]
     mode = sys.argv[1]
     if mode == "ppl":
         import tiktoken
