@@ -799,6 +799,12 @@ The probes in `research/` (run: `uv run mojo run research/<file>.mojo`):
 - **`test_barrier.mojo`**: a parallel region costs ~23 µs of overhead, a
   spin barrier ~1 µs; basis for the M6 team decode (which also needed one
   thread per core and a spin-then-yield barrier on a busy machine).
+- **`test_gelu.mojo`**: integer GELU (Q12) by lookup table is accurate to
+  ~1 Q12 step (2 KB table with interpolation: max error 4.0e-4) but 3-4x
+  slower than SIMD float tanh (0.40 ns/element); `x·σ(1.702x)` and I-BERT's
+  i-GELU miss GPT-2's tanh form by ~2e-2. Side finding for M6: decode's
+  GELU (`kernels.finish`) uses scalar tanh (3.0 ns), ~0.11 ms per token;
+  vectorizing the MLP up-projection's epilogue would recover most of it.
 
 Hardware of the development machine (i7-1160G7): 4 cores / 8 threads, one
 512-bit FMA unit per core, 5 MB L2, 12 MB L3, 16 GB RAM, measured ~44–55 GB/s
