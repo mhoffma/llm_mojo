@@ -11,6 +11,7 @@ order of floating-point operations, so they give bit-identical results.
 """
 
 from std.math import exp, tanh, sqrt, round
+from std.memory import bitcast
 from std.memory.alloc import unsafe_alloc
 from std.runtime import parallelism_level
 from max.algorithm import parallelize
@@ -33,13 +34,15 @@ comptime MAX_PARTS = 64
 
 
 @always_inline
-def store_out[RESID: Bool, GELU: Bool](o: FPtr, off: Int, var r: F32V):
+def store_out[
+    RESID: Bool, GELU: Bool, width: Int = NW
+](o: FPtr, off: Int, var r: SIMD[DType.float32, width]):
     """Applies the optional GELU, adds the residual, and stores."""
     comptime if GELU:
         comptime s = Float32(0.7978845608028654)  # sqrt(2/pi)
         r = 0.5 * r * (1 + tanh(s * (r + 0.044715 * r * r * r)))
     comptime if RESID:
-        r += o.unsafe_load[width=NW](off)
+        r += o.unsafe_load[width=width](off)
     o.unsafe_store(off, r)
 
 
@@ -463,8 +466,10 @@ def matmul_rows_a16[
 
     - One token (decode): threads split the output rows; w.dot_row_i16
       unpacks and multiplies in one pass.
-    - Several tokens (prefill): each output row is unpacked to int16 once and
-      reused for 4 tokens at a time.
+    - Several tokens (prefill): threads take 32 output rows at a time, unpack
+      them to int16 in the VNNI layout, and run register tiles of 4 tokens x
+      32 outputs over all tokens (tile_i16), so group scales are applied
+      once per group per tile.
     """
     var xq = unsafe_alloc[Int16](T * IN)
     var sx = unsafe_alloc[Float32](T)
@@ -484,37 +489,158 @@ def matmul_rows_a16[
         parallelize(one, (OUT + RB - 1) // RB)
     else:
         var G = w.group_size()
+        comptime NV = 2
+        comptime TN = NV * 16  # output rows per tile
+        comptime TM = 4  # tokens per register tile
+        var full = OUT // TN
+        var ntasks = full + (1 if OUT % TN != 0 else 0)
 
-        def rows(ti: Int) {imm}:
-            var wq = unsafe_alloc[Int16](IN)
-            var ws = unsafe_alloc[Float32](IN // G)
-            for o in range(ti * RB, min(OUT, (ti + 1) * RB)):
-                w.unpack_row_i16(o, wq, ws)
-                var bias = Float32(0)
-                comptime if BIAS:
-                    bias = b[unsafe_offset=o]
-                var t = 0
-                while t + 4 <= T:
-                    var d = dot4_i16(wq, ws, xq.unsafe_offset(t * IN), IN, G)
-                    comptime for k in range(4):
-                        finish[RESID, GELU](
-                            out_,
-                            (t + k) * OUT + o,
-                            d[k] * sx[unsafe_offset = t + k] + bias,
-                        )
-                    t += 4
-                while t < T:
-                    var d = dot1_i16(wq, ws, xq.unsafe_offset(t * IN), IN, G)
-                    finish[RESID, GELU](
-                        out_, t * OUT + o, d * sx[unsafe_offset=t] + bias
-                    )
-                    t += 1
-            wq.unsafe_free()
-            ws.unsafe_free()
+        def tile_task(ti: Int) {imm}:
+            if ti == full:  # the last OUT % TN rows (the vocabulary, 50257)
+                rows_i16[RESID, GELU, BIAS](
+                    out_, xq, sx, w, b, T, IN, OUT, G, full * TN, OUT
+                )
+                return
+            var o0 = ti * TN
+            # Unpack TN output rows into the VNNI layout: for each pair of
+            # inputs (k, k+1), the TN outputs' weights as int16 pairs, so one
+            # 32-lane load holds 16 outputs x 2 inputs.
+            var wt = unsafe_alloc[Int16](IN * TN)
+            var st = unsafe_alloc[Float32](IN // G * TN)  # [group][output]
+            var row = unsafe_alloc[Int16](IN)
+            var rs = unsafe_alloc[Float32](IN // G)
+            for j in range(TN):
+                w.unpack_row_i16(o0 + j, row, rs)
+                for k in range(IN):
+                    wt[unsafe_offset = ((k // 2) * TN + j) * 2 + k % 2] = row[
+                        unsafe_offset=k
+                    ]
+                for g in range(IN // G):
+                    st[unsafe_offset = g * TN + j] = rs[unsafe_offset=g]
+            var t = 0
+            while t + TM <= T:
+                tile_i16[TM, NV, RESID, GELU, BIAS](
+                    out_, xq, sx, wt, st, b, t, o0, IN, OUT, G
+                )
+                t += TM
+            while t < T:
+                tile_i16[1, NV, RESID, GELU, BIAS](
+                    out_, xq, sx, wt, st, b, t, o0, IN, OUT, G
+                )
+                t += 1
+            wt.unsafe_free()
+            st.unsafe_free()
+            row.unsafe_free()
+            rs.unsafe_free()
 
-        parallelize(rows, (OUT + RB - 1) // RB)
+        parallelize(tile_task, ntasks)
     xq.unsafe_free()
     sx.unsafe_free()
+
+
+@always_inline
+def tile_i16[
+    TM: Int, NV: Int, RESID: Bool, GELU: Bool, BIAS: Bool
+](
+    out_: FPtr,
+    xq: I16Ptr,
+    sx: FPtr,
+    wt: I16Ptr,
+    st: FPtr,
+    b: FPtr,
+    t0: Int,
+    o0: Int,
+    IN: Int,
+    OUT: Int,
+    G: Int,
+):
+    """Computes a TM x (NV*16) tile of the integer matmul, in registers.
+
+    wt holds NV*16 output rows in the VNNI layout (see matmul_rows_a16) and
+    st their group scales as [group][output]. For each input pair (k, k+1),
+    token m's two int16 activations are broadcast as one int32 to all 16
+    lanes, and one VPDPWSSD per NV adds x(k)*w(o,k) + x(k+1)*w(o,k+1) for 16
+    outputs o. At the end of each group, the int32 sums become float and
+    take the group's scale, for the whole tile at once.
+
+    Here one int32 lane sums a whole group for one output, so the sums are
+    moved to float at least every SEG inputs: 256 products of at most
+    32767 * 255 (int16 activation times int8 code minus zero point) is
+    2.139e9, just under 2^31. The scale is the same across a group, so where
+    a group is split doesn't change the result.
+    """
+    comptime TN = NV * 16
+    comptime SEG = 256
+    var x32 = xq.unsafe_bitcast[Int32]()  # activation pairs, one per int32
+    var accf = Array[F32x16, length = TM * NV](fill=F32x16(0))
+    var seg = min(G, SEG)
+    for k0 in range(0, IN, seg):
+        var g = k0 // G
+        var acc = Array[I32x16, length = TM * NV](fill=I32x16(0))
+        for kp in range(k0 // 2, (k0 + seg) // 2):
+            var wv = Array[I16x32, length=NV](fill=I16x32(0))
+            comptime for v in range(NV):
+                wv[v] = wt.unsafe_load[width=32]((kp * TN + v * 16) * 2)
+            comptime for m in range(TM):
+                var pair = x32[unsafe_offset = (t0 + m) * (IN // 2) + kp]
+                var xb = bitcast[DType.int16, 32](I32x16(pair))
+                comptime for v in range(NV):
+                    acc[m * NV + v] = dot_pairs(acc[m * NV + v], xb, wv[v])
+        comptime for v in range(NV):
+            var s = st.unsafe_load[width=16](g * TN + v * 16)
+            comptime for m in range(TM):
+                accf[m * NV + v] = acc[m * NV + v].cast[DType.float32]().fma(
+                    s, accf[m * NV + v]
+                )
+    comptime for m in range(TM):
+        var sxm = F32x16(sx[unsafe_offset = t0 + m])
+        var orow = out_.unsafe_offset((t0 + m) * OUT + o0)
+        comptime for v in range(NV):
+            var r = accf[m * NV + v] * sxm
+            comptime if BIAS:
+                r += b.unsafe_load[width=16](o0 + v * 16)
+            store_out[RESID, GELU, 16](orow, v * 16, r)
+
+
+def rows_i16[
+    W: WeightMatrix, //, RESID: Bool, GELU: Bool, BIAS: Bool
+](
+    out_: FPtr,
+    xq: I16Ptr,
+    sx: FPtr,
+    w: W,
+    b: FPtr,
+    T: Int,
+    IN: Int,
+    OUT: Int,
+    G: Int,
+    o_start: Int,
+    o_end: Int,
+):
+    """Output rows o_start..o_end-1 one at a time: unpack the row to int16,
+    then dot it with 4 tokens at a time. For the rows left over after the
+    tiles."""
+    var wq = unsafe_alloc[Int16](IN)
+    var ws = unsafe_alloc[Float32](IN // G)
+    for o in range(o_start, o_end):
+        w.unpack_row_i16(o, wq, ws)
+        var bias = Float32(0)
+        comptime if BIAS:
+            bias = b[unsafe_offset=o]
+        var t = 0
+        while t + 4 <= T:
+            var d = dot4_i16(wq, ws, xq.unsafe_offset(t * IN), IN, G)
+            comptime for k in range(4):
+                finish[RESID, GELU](
+                    out_, (t + k) * OUT + o, d[k] * sx[unsafe_offset = t + k] + bias
+                )
+            t += 4
+        while t < T:
+            var d = dot1_i16(wq, ws, xq.unsafe_offset(t * IN), IN, G)
+            finish[RESID, GELU](out_, t * OUT + o, d * sx[unsafe_offset=t] + bias)
+            t += 1
+    wq.unsafe_free()
+    ws.unsafe_free()
 
 
 @always_inline

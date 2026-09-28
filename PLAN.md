@@ -50,7 +50,7 @@ accuracy each format costs for that speed**.
 | M1. Generic weight formats, float32 bit-identical to baseline | ✅ done |
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
-| M4. int16 activations + integer VNNI kernel (W4A16) | 🔄 working and verified; decode faster for large groups; integer prefill tiles next |
+| M4. int16 activations + integer VNNI kernel (W4A16) | 🔄 working and verified; integer prefill tiles done (~890 tok/s); cheaper decode for small groups next |
 | M5. Tuning and final results table | ☐ |
 | M6. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
@@ -175,6 +175,8 @@ users can install Modular's Mojo extension.
 | Perplexity matches NumPy | `uv run --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt` vs `./gpt2t_bin --ppl tests/data/alice_ch1.txt` | same to ~6 digits (25.2843) |
 | Our quantizer matches NumPy | add `--quant 4,32,0` (bits, group, symmetric) to the reference; compare with `--dtype int4-g32` | same to ~6 digits |
 | GGUF dequantization matches llama.cpp's Python `gguf` | `uv run --with gguf python tests/gguf_check.py gpt2/gguf/gpt2.Q4_K_M.gguf` (runs `tests/gguf_dump.mojo`) | relative error ≤ 1e-5 (measured ~4e-8 for all six block formats) |
+| Integer (A16) kernels match exact math | `uv run mojo run -I . tests/a16_kernels.mojo` | `PASS` (max relative error ≤ 1e-5; measured ~1.6e-7) |
+| A16 perplexity matches NumPy | `uv run --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --quant 4,32,0 --quant-head 8,0,0 --act16` vs `./gpt2t_bin --dtype int4-g32-a16 --ppl tests/data/alice_ch1.txt` | same to ~1e-4 relative (int16 rounding flips; see M4) |
 | GGUF perplexity matches NumPy | `uv run --with gguf --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --gguf FILE` vs `./gpt2t_bin --gguf FILE --ppl tests/data/alice_ch1.txt` | same to ~6 digits |
 
 Build both binaries before running these. Run `tests/same_as_baseline.sh`
@@ -396,12 +398,27 @@ Expectation to test: per-channel is fine for int8, but at int4 groups of
   | int4, per-channel | 119 | 138 | +16% |
   | int8, per-channel | 116 | 152 | +30% |
 
-  Prefill is slower in integers (427–493 vs 572–646 tok/s): `dot4_i16`
-  works one output row at a time, while the float path uses the 8×32
-  register-tiled `mm_tile`.
-- Next: an integer register-tiled prefill kernel (several output rows ×
-  several tokens), and cheaper per-group scaling for small groups (e.g.
-  accumulating int32 group sums for 16 groups before converting).
+- **Integer prefill tiles** (`kernels.tile_i16`): each task unpacks 32
+  output rows into the VNNI layout (for each input pair (k, k+1), the 32
+  outputs' int16 weight pairs, so one 32-lane load covers 16 outputs × 2
+  inputs), then runs register tiles of 4 tokens × 32 outputs: each
+  activation pair is broadcast as one int32 and one VPDPWSSD per 16 outputs
+  accumulates it. Group scales are applied once per group per tile, so even
+  32-weight groups gain. One int32 lane sums a whole group here, so sums are
+  flushed to float every 256 inputs (256 × 32767 × 255 < 2^31). Leftover
+  rows (the vocabulary's 50257 % 32) use the row path (`rows_i16`).
+  Prefill: int4-g32-a16 885 tok/s, int8-ch-a16 899 (float compute: 679 and
+  624; f16: 538), on AC.
+- `tests/a16_kernels.mojo` checks all integer paths (one token, tiles,
+  leftover rows, token counts not a multiple of 4, and worst-case
+  activations that would overflow int32 without flushing) against exact
+  float64 math on the same quantized values: max error ~1.6e-7 relative.
+  Perplexity differs between integer paths by ~1e-4 relative even though
+  the kernels are exact: int16 rounding of activations turns 1e-7
+  differences into occasional one-step flips, which compound over layers.
+- Next: cheaper per-group scaling for small groups in decode (int4-g32-a16
+  decode gains only ~10%), e.g. accumulating int32 group sums for 16 groups
+  before converting.
 
 Original plan:
 
@@ -521,7 +538,10 @@ on battery, measured with f16 (561 / 100 / 85), Q4_K_M (608 / 108 / 89) and
 Q4_0 (605 / 92 / 79) in the same session. †W4A16/W8A16: 3 rounds on
 battery with f16 (624 / 94 / 78), int4-g32 (646 / 95 / 68), int8-ch
 (572 / 116 / 96), Q4_K_M (570 / 84 / 64). ‡2 rounds on battery with int4-g128
-(622 / 115 / 94) and int4-ch (607 / 119 / 97). Speed ranges are from two interleaved
+(622 / 115 / 94) and int4-ch (607 / 119 / 97). §With the integer prefill
+tiles: 3 rounds on AC with f16 (538 / 84 / 58), int4-g32 (679 / 85 / 68),
+int8-ch (624 / 112 / 79). int4-g128-a16's prefill was measured before the
+tiles. Speed ranges are from two interleaved
 rounds; the machine's speed drifts by ±15% between runs (thermal), so compare
 formats measured in the same session.
 
@@ -560,10 +580,10 @@ Notes on f16 / bf16:
 | GGUF Q4_0 (head Q6_K) | 99 MB | 710 | 80 / 79 | 27.178 (+7.49%) | 74.6% | 1.7e-1 |
 | GGUF Q4_K_M (Q4_K/Q5_K/Q6_K, head Q6_K) | 105 MB | 690 | 107 / 90 | 25.460 (+0.70%) | 80.2% | 9.8e-2 |
 | GGUF i1-Q4_K_M (NumPy only so far) | 105 MB | | | 27.615 (+9.2%) | | |
-| int4, group 32, W4A16 + int8 head (A16) | 88 MB | 427† | 87 / 74† | 25.591 (+1.21%) | | |
-| int8, per-channel, W8A16 | 121 MB | 493† | **152 / 119**† | 26.116 (+3.29%) | | |
+| int4, group 32, W4A16 + int8 head (A16) | 88 MB | **885**§ | 95 / 78§ | 25.593 (+1.22%) | | |
+| int8, per-channel, W8A16 | 121 MB | **899**§ | 135 / 103§ (152 / 119†) | 26.117 (+3.29%) | | |
 | int4, group 128, W4A16 | 82 MB | 469‡ | 126 / 105‡ | | | |
-| int4, per-channel, W4A16 | 81 MB | 455‡ | 138 / 112‡ | | | |
+| int4, per-channel, W4A16 | 81 MB | 888§ | 126 / 100§ | | | |
 
 ## Open questions
 

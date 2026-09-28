@@ -229,9 +229,12 @@ struct QuantMatrix[
     inner sums run in integers: `dot_row_i16` unpacks 32 codes to int16,
     subtracts the zero point, and multiplies-and-adds them with 32 int16
     activations in one VPDPWSSD; each group's int32 sums then take the
-    group's scale in float. |x_q| <= 32767 and |u - zero_point| <= 255, so a
-    lane gathers at most 2 * 32767 * 255 per 32 weights, and even a 3072-wide
-    group stays below 2^31.
+    group's scale in float. |x_q| <= 32767 and |u - zero_point| <= 255, and
+    here each of the 16 int32 lanes sums 2 of every 32 products, so a lane
+    gathers at most 2 * 32767 * 255 per 32 weights and even a 3072-wide group
+    (192 products per lane) stays below 2^31. (The prefill tile kernel sums
+    a whole group in one lane, so it flushes to float every 256 inputs; see
+    kernels.tile_i16.)
 
     Rounding is plain round-to-nearest.
     """
