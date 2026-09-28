@@ -4,13 +4,15 @@ GPT-2 124M inference on the CPU, written from scratch in [Mojo](https://www.modu
 
 The project measures **what each weight format costs in accuracy and gains in speed** on a laptop CPU. Every format runs through the same model code and the same accuracy test against float32. Every kernel is checked against an independent NumPy implementation.
 
-int4 weights (group 32) with an int8 output head and int16 activations: 88 MB instead of 474 MB, +1.2% perplexity, on a 4-core laptop:
+int4 weights (group 32) with an int8 output head and int16 activations: 88 MB instead of 474 MB, about +1% perplexity, and 3.2× float32's decode speed (300 vs 93 tok/s) on a 4-core laptop:
 
 ```text
 $ MODULAR_THREAD_BUSY_WAIT_US=0 ./gpt2t_bin --dtype int4-g32-a16 -n 40 "In a shocking finding, scientists discovered a herd of unicorns"
-In a shocking finding, scientists discovered a herd of unicorns, which could have been created to be a replacement for the extinct chrysalis. The unicorns are thought to have been transported from a wild animal to a zoo somewhere, or from one animal to
+In a shocking finding, scientists discovered a herd of unicorns, a feat that could not be achieved without the help of a little help from a tiny, non-human centipede!
+
+Researchers from the University of Copenhagen found the tiny unicorns,
 ---
-dtype int4-g32-a16+head-int8-ch-a16 | 88 MB | load 2391 ms | prompt 12 tokens in 51 ms ( 231 tok/s ) | generated 40 tokens in 266 ms ( 150 tok/s )
+dtype int4-g32-a16+head-int8-ch-a16+kv-int8 | 88 MB | load 2006 ms | prompt 12 tokens in 55 ms ( 217 tok/s ) | generated 40 tokens in 144 ms ( 277 tok/s )
 ```
 
 (Generation uses top-k 40 sampling with temperature 0.8 and a fixed seed, so the text repeats run to run. The load time includes quantizing the float32 weights at startup.)
@@ -66,22 +68,24 @@ dtype int4-g32-a16+head-int8-ch-a16 | 88 MB | load 2391 ms | prompt 12 tokens in
 All measurements are on an Intel i7-1160G7 laptop (Tiger Lake, 4 cores / 8 threads, AVX-512 + VNNI, 16 GB), on AC power, with `MODULAR_THREAD_BUSY_WAIT_US=0`.
 
 - **Accuracy** is measured on `tests/data/alice_ch1.txt` (3,307 scored tokens) against float32. Lower perplexity is better; lower KL means closer to float32.
-- **Prompt speed** is for a 476-token prompt. **Decode speed** is for 100–200 generated tokens after a short prompt.
-- Speeds are medians of 2–3 interleaved rounds (`tests/bench.sh`). The machine drifts by about ±15% between sessions, so treat them as approximate. Session-by-session numbers are in [`PLAN.md`](PLAN.md#results).
-- **The decode speeds in this table were measured before the team decode (M6),** which made decoding about 40% faster; see [Decode with a thread team](#decode-with-a-thread-team) for current numbers. A clean re-run of every format is planned.
+- **Prompt speed** is for a 476-token prompt. **Decode speed** is for 100 generated tokens after a 1-token prompt (short) and after the 476-token prompt (long).
+- Accuracy and speed are from one clean session (2026-09-28, after the M6 tuning): speeds are medians of 5 interleaved rounds of `tests/bench.sh`, which varied by only a few percent between rounds. The frozen float32 program `gpt2.mojo` ran at 635 / 63 / 56 tok/s in the same session. Older, session-by-session numbers are in [`PLAN.md`](PLAN.md#results).
+- Quantized formats use an int8 KV cache by default (f16 and bf16 keep their own type), so their accuracy includes the cache's error.
 
-| Format | Weights | Perplexity (Δ vs f32) | Top-1 vs f32 | Mean KL vs f32 | Prompt tok/s | Decode tok/s |
+| Format | Weights | Perplexity (Δ vs f32) | Top-1 vs f32 | Mean KL vs f32 | Prompt tok/s | Decode tok/s (short / long) |
 |---|---|---|---|---|---|---|
-| f32 | 474 MB | 25.284 | 100% | 0 | ~560 | ~60 |
-| f16 | 239 MB | 25.302 (+0.07%) | 99.7% | 0.00002 | ~550 | ~90 |
-| bf16 | 239 MB | 25.073 (−0.84%)¹ | 95.1% | 0.0074 | ~610 | ~80 |
-| GGUF Q8_0 (8-bit head) | 167 MB | 25.416 (+0.52%) | 91.1% | 0.012 | ~575 | ~63 |
-| GGUF Q4_K_M (4/5/6-bit mix) | 105 MB | 25.460 (+0.70%) | 80.2% | 0.098 | ~690 | ~107 |
-| GGUF Q4_0 (6-bit head) | 99 MB | 27.178 (+7.5%) | 74.6% | 0.170 | ~710 | ~80 |
-| int8 per-channel (ours) | 121 MB | 26.116 (+3.3%) | 81.6% | 0.046 | ~660 | ~124 |
-| int4 group 32, int8 head (ours) | 88 MB | 25.592 (+1.2%) | 75.1% | 0.147 | ~640 | ~99 |
-| **int4 group 32, int8 head, int16 activations (ours, `int4-g32-a16`)** | **88 MB** | **25.593 (+1.2%)** | | | **~800** | **~140** |
-| int8 per-channel, int16 activations (ours, `int8-ch-a16`) | 121 MB | 26.117 (+3.3%) | | | ~900 | ~135 |
+| f32 | 474 MB | 25.284 | 100% | 0 | 656 | 93 / 83 |
+| f16 | 239 MB | 25.303 (+0.07%) | 99.7% | 0.00002 | 809 | 157 / 139 |
+| bf16 | 239 MB | 25.065 (−0.87%)¹ | 95.2% | 0.0075 | 760 | 156 / 138 |
+| GGUF Q8_0 (8-bit head) | 167 MB | 25.431 (+0.58%) | 91.1% | 0.012 | 881 | 128 / 118 |
+| GGUF Q4_K_M (4/5/6-bit mix, 6-bit head) | 105 MB | 25.475 (+0.75%) | 80.0% | 0.098 | 873 | 192 / 171 |
+| GGUF Q4_0 (6-bit head) | 99 MB | 27.197 (+7.6%) | 74.4% | 0.169 | 878 | 138 / 127 |
+| int8 per-channel (ours, `int8-ch`) | 121 MB | 26.142 (+3.4%) | 81.6% | 0.046 | 857 | 200 / 175 |
+| int4 group 32, int8 head (ours, `int4-g32`) | 88 MB | 25.521 (+0.93%) | 75.1% | 0.148 | 883 | 150 / 136 |
+| int8 per-channel, int16 activations (`int8-ch-a16`) | 121 MB | 26.164 (+3.5%) | 81.6% | 0.046 | **1358** | 283 / 241 |
+| int4 group 32, int8 head, int16 activations (`int4-g32-a16`) | 88 MB | 25.553 (+1.1%) | 75.2% | 0.148 | 1146 | 300 / 253 |
+| **`int4-g32-a16 --attention int`** (integer attention) | **88 MB** | **25.536 (+0.99%)** | 75.5% | 0.148 | 1150 | **300 / 278** |
+| int4 per-channel, int16 activations (`int4-ch-a16`) | 81 MB | 28.878 (+14.2%) | 61.0% | 0.408 | 1310 | 251 / 214 |
 
 ¹ bfloat16's lower perplexity is chance on this text, not better accuracy. Its KL divergence is about 430× float16's, and it changes the top prediction at 5% of positions.
 
@@ -99,10 +103,14 @@ All measurements are on an Intel i7-1160G7 laptop (Tiger Lake, 4 cores / 8 threa
   Asymmetric quantization (with a zero point) beats symmetric at every group size.
 - **Our simple round-to-nearest int4 (group 32, int8 head) lands between llama.cpp's Q4_0 and Q4_K_M.** It's better than Q4_0 and worse than Q4_K_M, which uses error-minimizing scales and 5/6-bit layers, and it's the smallest of the three.
 - **Perplexity alone is misleading.** Q4_K_M changes perplexity by only 0.7% but changes the top prediction at 20% of positions. The harness reports KL divergence for this reason.
-- **int16 activations cost nothing in accuracy** (int4-g32: 25.5921 → 25.5910) **and make the integer kernels faster**:
-  - Decode: int4-g32 95 → ~140 tok/s, and int8-ch 116 → ~135–150 tok/s.
-  - Prompts: 30–40% faster than the same weights with float compute.
-- **Starting threads was costing ~40% of decode time.** Running each decoded token as one parallel region, with a team of one thread per core, made decode ~40% faster (f16: 100 → 138 tok/s; int4-g32-a16 with integer attention: 167 → 237).
+- **int16 activations cost almost nothing in accuracy** (int4-g32: 25.592 → 25.591 with a float32 cache; 25.521 → 25.553 with the int8 cache, 0.1%) **and make the integer kernels faster**:
+  - Decode: int4-g32 150 → 300 tok/s, int8-ch 200 → 283 tok/s.
+  - Prompts: 30–60% faster than the same weights with float compute (int8-ch 857 → 1358 tok/s).
+- **Integer attention is free and helps long contexts:** same accuracy, decode after 476 tokens 253 → 278 tok/s.
+- **Decode speed follows bytes per token, once the per-token overheads are gone.** float32 → int4-a16 is 5.4× fewer weight bytes and 3.2× faster decode. The M6 tuning (one parallel region per token, vectorized epilogues, faster output heads) roughly doubled decode for every format since the first results (f16 ~90 → 157, int4-g32-a16 ~140 → 300 tok/s).
+- **GGUF files run as stored, without re-quantizing,** but their float dequantize-and-multiply kernels are slower than our integer ones (Q4_K_M 192 vs int4-g32-a16 300 tok/s decode).
+
+(The group-size sweep above was measured with a float32 KV cache.)
 
 ## Quick start
 
@@ -504,7 +512,7 @@ Mojo 1.1 differs a lot from older Mojo, which most online examples use. `PLAN.md
 | M3. float16 / bfloat16, own int8 / int4 with int8 head, GGUF, fast kernels | done |
 | M4. int16 activations with integer VNNI kernels (W4A16 / W8A16) | done |
 | M5. Pluggable KV cache formats matched to the model's precision, and integer attention | done |
-| M6. Tuning: profiling, one parallel region per decoded token (done, ~40% faster decode), vectorized GELU, faster output heads (done); a clean results re-run (next) | in progress |
+| M6. Tuning: profiling, one parallel region per decoded token, vectorized GELU, faster output heads, and a clean results re-run | done |
 | M7. Stretch: save pre-quantized weights, int8 activations (VPDPBUSD) | planned |
 
 Open questions (details in `PLAN.md`):

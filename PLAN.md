@@ -52,7 +52,7 @@ accuracy each format costs for that speed**.
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
 | M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) + integer attention | ✅ done: int8 cache default for quantized models (+10-16% long-context decode); `--attention int` (integer attention on an int8 VNNI-layout cache) another +9-15% long-context decode at no accuracy cost |
-| M6. Tuning and final results table | 🔄 profiling, vectorized KV store, one-region team decode (+~40% decode), vectorized decode GELU, faster output heads done; clean results run next |
+| M6. Tuning and final results table | ✅ profiling, vectorized KV store, one-region team decode (+~40% decode), vectorized decode GELU, faster output heads, clean results re-run done |
 | M7. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
 ## Getting started
@@ -751,7 +751,7 @@ Next steps, in order:
    token's per-layer work inside one parallel region with barriers between
    operations, as llama.cpp does.
 3. A faster output head (16% of decode). (Done, see below.)
-4. A clean results run of every format on a quiet machine.
+4. A clean results run of every format on a quiet machine. (Done: [Results](#results).)
 
 **Done (2026-09-28):**
 - `IntAttnKV.store` vectorized: ~3x faster (prompt share 8-11% -> 2-3%),
@@ -910,6 +910,56 @@ Things that differ from older Mojo, all hit during this project:
 - Record benchmark conditions (AC power, busy-wait setting) with the numbers.
 
 ## Results
+
+### Clean re-run (2026-09-28, after M6)
+
+One session, i7-1160G7 on AC power, quiet machine, `MODULAR_THREAD_BUSY_WAIT_US=0`,
+default options (decode team of 4 threads; KV cache f32/f16/bf16 for float
+formats, int8 for quantized ones). Speeds: medians of 5 interleaved rounds of
+
+    tests/bench.sh 5 f32 f16 bf16 int8-ch int4-g32 int8-ch-a16 int4-g32-a16 \
+      "--dtype int4-g32-a16 --attention int" int4-ch-a16 \
+      gpt2/gguf/gpt2.Q8_0.gguf gpt2/gguf/gpt2.Q4_K_M.gguf gpt2/gguf/gpt2.Q4_0.gguf
+
+(prefill: 476-token prompt; decode: 100 tokens after a 1-token prompt /
+after the 476-token prompt). Rounds varied by a few percent (f32 decode
+93 in rounds 2-5, 81 in round 1). Accuracy: `tests/compare.sh` with the
+same options on `tests/data/alice_ch1.txt`. The frozen `gpt2.mojo`
+(`gpt2_bin`) ran at 635 / 63 / 56 in the same session.
+
+| Format | Weights | Prefill tok/s | Decode tok/s (short / long) | Perplexity | Top-1 vs f32 | Mean KL | Mean logit diff |
+|---|---|---|---|---|---|---|---|
+| f32 | 474 MB | 656 | 93 / 83 | 25.284 | 100% | 0 | 0 |
+| f16 | 239 MB | 809 | 157 / 139 | 25.303 (+0.07%) | 99.7% | 1.8e-5 | 0.037 |
+| bf16 | 239 MB | 760 | 156 / 138 | 25.065 (−0.87%) | 95.2% | 7.5e-3 | 0.40 |
+| int8-ch | 121 MB | 857 | 200 / 175 | 26.142 (+3.39%) | 81.6% | 4.6e-2 | 1.45 |
+| int4-g32 (int8 head) | 88 MB | 883 | 150 / 136 | 25.521 (+0.93%) | 75.1% | 1.5e-1 | 13.1 |
+| int8-ch-a16 | 121 MB | **1358** | 283 / 241 | 26.164 (+3.48%) | 81.6% | 4.6e-2 | 1.50 |
+| int4-g32-a16 | 88 MB | 1146 | **300** / 253 | 25.553 (+1.06%) | 75.2% | 1.5e-1 | 13.0 |
+| int4-g32-a16 --attention int | 88 MB | 1150 | **300 / 278** | 25.536 (+0.99%) | 75.5% | 1.5e-1 | 13.0 |
+| int4-ch-a16 | 81 MB | 1310 | 251 / 214 | 28.878 (+14.2%) | 61.0% | 4.1e-1 | 26.1 |
+| GGUF Q8_0 | 167 MB | 881 | 128 / 118 | 25.431 (+0.58%) | 91.1% | 1.2e-2 | 1.04 |
+| GGUF Q4_K_M | 105 MB | 873 | 192 / 171 | 25.475 (+0.75%) | 80.0% | 9.8e-2 | 7.64 |
+| GGUF Q4_0 | 99 MB | 878 | 138 / 127 | 27.197 (+7.56%) | 74.4% | 1.7e-1 | 18.4 |
+
+Observations:
+- Against the first results (below), decode is ~1.5-2x faster for every
+  format (f16 ~90 -> 157, int4-g32-a16 ~140 -> 300, Q4_K_M ~107 -> 192):
+  the team decode, vectorized epilogues and faster output heads.
+  The machine also ran faster this session (f32 prefill 656 vs ~560-620).
+- float32 -> int4-g32-a16: 5.4x fewer weight bytes, 3.2x the decode speed.
+  Decode reads ~90 MB per token at 300 tok/s = ~27 GB/s, about half of what
+  this machine can stream; the rest is compute (dequantization, attention,
+  the arithmetic-bound GGUF kernels) and per-token overheads.
+- With the int8 cache default, int4-g32's perplexity (25.521) is lower than
+  with a float32 cache (25.592): chance, like bf16's; KL is unchanged.
+- The mean logit difference of the int4 formats (~13) is large next to
+  int8's (~1.5) while KL stays moderate: probably a shift shared by all
+  logits of a position, which softmax ignores (not checked yet).
+- GGUF prefill (~880) is now below our integer formats (1150-1360): GGUF
+  prefill still dequantizes to float tiles.
+
+### Earlier sessions
 
 On the i7-1160G7, AC power, `MODULAR_THREAD_BUSY_WAIT_US=0`. Prefill: 476-token
 prompt. Decode: 200 tokens after a short prompt / after the 476-token prompt.
