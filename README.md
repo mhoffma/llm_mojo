@@ -4,11 +4,16 @@ GPT-2 124M inference on the CPU, written from scratch in [Mojo](https://www.modu
 
 The project measures **what each weight format costs in accuracy and gains in speed** on a laptop CPU. Every format runs through the same model code and the same accuracy test against float32. Every kernel is checked against an independent NumPy implementation.
 
-```sh
-# int4 weights (group 32) with an int8 output head and int16 activations:
-# 88 MB instead of 474 MB, +1.2% perplexity, ~140 tokens/s on a 4-core laptop
-./gpt2t_bin --dtype int4-g32-a16 -n 40 "In a shocking finding, scientists discovered a herd of unicorns"
+int4 weights (group 32) with an int8 output head and int16 activations: 88 MB instead of 474 MB, +1.2% perplexity, on a 4-core laptop:
+
+```text
+$ MODULAR_THREAD_BUSY_WAIT_US=0 ./gpt2t_bin --dtype int4-g32-a16 -n 40 "In a shocking finding, scientists discovered a herd of unicorns"
+In a shocking finding, scientists discovered a herd of unicorns, which could have been created to be a replacement for the extinct chrysalis. The unicorns are thought to have been transported from a wild animal to a zoo somewhere, or from one animal to
+---
+dtype int4-g32-a16+head-int8-ch-a16 | 88 MB | load 2391 ms | prompt 12 tokens in 51 ms ( 231 tok/s ) | generated 40 tokens in 266 ms ( 150 tok/s )
 ```
+
+(Generation uses top-k 40 sampling with temperature 0.8 and a fixed seed, so the text repeats run to run. The load time includes quantizing the float32 weights at startup.)
 
 ## Contents
 
