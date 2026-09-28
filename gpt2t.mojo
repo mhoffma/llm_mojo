@@ -1,8 +1,9 @@
 """GPT-2 124M inference on CPU, generic over the weight storage format.
 
 Same program as gpt2.mojo, restructured so the big weight matrices can be
-stored in different formats (see tensor.mojo). The model is `Model[W]` for a
-format `W`; `main` picks W from --dtype and calls the generic `run[W]`, so
+stored in different formats (see tensor.mojo). The model is `Model[W, E]` for
+a layer format `W` and head format `E`; `main` picks them from --dtype and
+--head and calls the generic `run[W, E]`, so
 each format gets its own compiled copy of the whole forward pass.
 
 Usage:
@@ -18,6 +19,8 @@ Usage:
     -k TOPK      sample from the TOPK most likely tokens; 0 = all (default: 40)
     -s SEED      random seed (default: 1337)
     -v           print prompt token ids and the top-5 next-token logits
+    --head FMT   with an int --dtype: the tied embedding/output head's format,
+                 int8 (default; int8, per vocabulary row) or same (as --dtype)
     --gguf FILE  use the weights in a llama.cpp GGUF file of GPT-2 124M
                  (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 tensors), as
                  stored; overrides --dtype. The tokenizer still comes from -m.
@@ -136,15 +139,20 @@ def read_safetensors(path: String, mut header: String) raises -> FPtr:
     return params
 
 
-struct Model[W: WeightMatrix](Movable):
-    """GPT-2 with its large matrices stored in format W.
+struct Model[W: WeightMatrix, E: WeightMatrix = W](Movable):
+    """GPT-2 with its layer matrices stored in format W, and its token
+    embedding / output head (wte, lm) in format E, W by default.
+
+    The output head is the tensor most sensitive to quantization, so the
+    quantized formats keep it at int8 (see HEAD8), as llama.cpp keeps
+    GPT-2's at 6-bit.
 
     Build one with `load_model` (Hugging Face safetensors, converted to W) or
     `load_gguf` (a llama.cpp GGUF file, used as stored).
     """
 
-    var wte: Self.W  # [V, C] token embedding
-    var lm: Self.W  # [V, C] output head: the same handle as wte when tied
+    var wte: Self.E  # [V, C] token embedding
+    var lm: Self.E  # [V, C] output head: the same handle as wte when tied
     var tied: Bool
     var mats: List[Self.W]  # N_LAYER * N_MATS layer matrices
     var file: BPtr  # file buffer the matrices point into (GGUF), or unused
@@ -166,8 +174,8 @@ struct Model[W: WeightMatrix](Movable):
 
     def __init__(
         out self,
-        wte: Self.W,
-        lm: Self.W,
+        wte: Self.E,
+        lm: Self.E,
         tied: Bool,
         var mats: List[Self.W],
         small_src: List[FPtr],
@@ -333,12 +341,14 @@ struct Model[W: WeightMatrix](Movable):
 comptime SMALL_FLOATS = N_LAYER * LAYER_VEC_FLOATS + MAX_T * C + 2 * C
 
 
-def load_model[W: WeightMatrix](path: String) raises -> Model[W]:
-    """Loads Hugging Face float32 safetensors and converts the large
-    matrices to W. The output head is tied to wte."""
+def load_model[
+    W: WeightMatrix, E: WeightMatrix = W
+](path: String) raises -> Model[W, E]:
+    """Loads Hugging Face float32 safetensors and converts the layer
+    matrices to W and wte (the tied embedding and output head) to E."""
     var header = String()
     var params = read_safetensors(path, header)
-    var wte = W.from_f32(
+    var wte = E.from_f32(
         tensor(header, params, "wte.weight"), V, C, reduce_rows=False
     )
     var mats = List[W](capacity=N_LAYER * N_MATS)
@@ -357,7 +367,9 @@ def load_model[W: WeightMatrix](path: String) raises -> Model[W]:
     small.append(tensor(header, params, "wpe.weight"))
     small.append(tensor(header, params, "ln_f.weight"))
     small.append(tensor(header, params, "ln_f.bias"))
-    var model = Model[W](wte, wte, True, mats^, small, unsafe_alloc[UInt8](1))
+    var model = Model[W, E](
+        wte, wte, True, mats^, small, unsafe_alloc[UInt8](1)
+    )
     params.unsafe_free()  # the model copied what it keeps
     return model^
 
@@ -511,6 +523,7 @@ struct Args(Movable):
     var ppl: String  # evaluation text file; empty = generate instead
     var compare: Bool  # with ppl: also compare against float32
     var gguf: String  # GGUF weights file; overrides --dtype
+    var head: String  # output head format for int formats: int8 or same
 
     def __init__(out self) raises:
         self.dtype = "f32"
@@ -524,6 +537,7 @@ struct Args(Movable):
         self.ppl = ""
         self.compare = False
         self.gguf = ""
+        self.head = "int8"
         var args = argv()
         var a = 1
         while a < len(args):
@@ -540,6 +554,8 @@ struct Args(Movable):
                     self.ppl = val
                 elif arg == "--gguf":
                     self.gguf = val
+                elif arg == "--head":
+                    self.head = val
                 elif arg == "-m":
                     self.dir = val
                 elif arg == "-n":
@@ -558,10 +574,10 @@ struct Args(Movable):
             a += 1
 
 
-def generate[W: WeightMatrix](args: Args) raises:
+def generate[W: WeightMatrix, E: WeightMatrix](args: Args) raises:
     """Loads the model with weights in format W and generates text."""
     var t_load = perf_counter_ns()
-    var model = load[W](args)
+    var model = load[W, E](args)
     var tok = Tokenizer(args.dir)
     var load_ms = Float64(perf_counter_ns() - t_load) / 1e6
 
@@ -611,7 +627,7 @@ def generate[W: WeightMatrix](args: Args) raises:
     print("\n---", file=FileDescriptor(2))
     print(
         "dtype",
-        W.name(),
+        model_name[W, E](),
         "|",
         model.weight_bytes() // (1024 * 1024),
         "MB | load",
@@ -722,8 +738,12 @@ def score_rows[
 
 
 def eval_loop[
-    W: WeightMatrix, B: WeightMatrix, COMPARE: Bool
-](model: Model[W], base: Model[B], ids: List[Int], name: String) raises:
+    W: WeightMatrix,
+    E: WeightMatrix,
+    B: WeightMatrix,
+    BE: WeightMatrix,
+    COMPARE: Bool,
+](model: Model[W, E], base: Model[B, BE], ids: List[Int], name: String) raises:
     """Scores every token of ids after the first, in sliding windows.
 
     With COMPARE, also runs `base` (float32) on the same windows and compares
@@ -777,12 +797,20 @@ def eval_loop[
         name, ":", scored, "tokens scored in", windows, "windows of",
         EVAL_WINDOW, "(stride", EVAL_STRIDE, ") in", secs, "s",
     )
-    print("  ", W.name(), "perplexity", ppl, " mean NLL", totals[NLL] / cnt, "nats")
+    print(
+        "  ",
+        model_name[W, E](),
+        "perplexity",
+        ppl,
+        " mean NLL",
+        totals[NLL] / cnt,
+        "nats",
+    )
     comptime if COMPARE:
         var ppl_b = exp(totals[NLL_BASE] / cnt)
         print("   f32 perplexity", ppl_b, " change", (ppl / ppl_b - 1) * 100, "%")
         print("   top-1 agreement with f32:", totals[AGREE] / cnt * 100, "%")
-        print("   mean KL(f32 || ", W.name(), "):", totals[KL] / cnt, "nats")
+        print("   mean KL(f32 || ", model_name[W, E](), "):", totals[KL] / cnt, "nats")
         print(
             "   logit |diff| vs f32: mean", totals[DIFF_SUM] / (cnt * V),
             " max", diff_max,
@@ -792,7 +820,7 @@ def eval_loop[
     stats.unsafe_free()
 
 
-def evaluate[W: WeightMatrix](args: Args) raises:
+def evaluate[W: WeightMatrix, E: WeightMatrix](args: Args) raises:
     """--ppl: perplexity of the text in args.ppl, and with --compare, how far
     format W's predictions are from float32's."""
     var tok = Tokenizer(args.dir)
@@ -800,30 +828,52 @@ def evaluate[W: WeightMatrix](args: Args) raises:
     var ids = tok.encode(text)
     if len(ids) < 2:
         raise Error("need at least 2 tokens in " + args.ppl)
-    var model = load[W](args)
+    var model = load[W, E](args)
     if args.compare:
         var base = load_model[F32](args.dir + "/model.safetensors")
-        eval_loop[W, F32, True](model, base, ids, args.ppl)
+        eval_loop[W, E, F32, F32, True](model, base, ids, args.ppl)
     else:
         # Without COMPARE the baseline is never used; pass model itself.
-        eval_loop[W, W, False](model, model, ids, args.ppl)
+        eval_loop[W, E, W, E, False](model, model, ids, args.ppl)
 
 
-def load[W: WeightMatrix](args: Args) raises -> Model[W]:
-    """Loads the model for format W: from --gguf for GGUF, otherwise from
-    the Hugging Face safetensors, converted to W."""
+def load[W: WeightMatrix, E: WeightMatrix](args: Args) raises -> Model[W, E]:
+    """Loads the model for formats W and E: from --gguf for GGUF, otherwise
+    from the Hugging Face safetensors, converted."""
     comptime if W.OUT_MAJOR:
-        # W is GGUFMatrix here; rebind_var tells the compiler so.
-        return rebind_var[Model[W]](load_gguf(args.gguf))
+        # W and E are GGUFMatrix here; rebind_var tells the compiler so.
+        return rebind_var[Model[W, E]](load_gguf(args.gguf))
     else:
-        return load_model[W](args.dir + "/model.safetensors")
+        return load_model[W, E](args.dir + "/model.safetensors")
 
 
-def run[W: WeightMatrix](args: Args) raises:
+def model_name[W: WeightMatrix, E: WeightMatrix]() -> String:
+    """The format's name, plus the head's when it differs."""
+    if W.name() == E.name():
+        return W.name()
+    return W.name() + "+head-" + E.name()
+
+
+comptime HEAD8 = QuantMatrix[8, 0, False]
+"""The output head format for quantized layers: int8, one scale and zero
+point per vocabulary row."""
+
+
+def run[W: WeightMatrix, E: WeightMatrix = W](args: Args) raises:
     if args.ppl.byte_length() > 0:
-        evaluate[W](args)
+        evaluate[W, E](args)
     else:
-        generate[W](args)
+        generate[W, E](args)
+
+
+def run_quantized[W: WeightMatrix](args: Args) raises:
+    """Runs a quantized layer format with the head chosen by --head."""
+    if args.head == "int8":
+        run[W, HEAD8](args)
+    elif args.head == "same":
+        run[W, W](args)
+    else:
+        raise Error("unknown --head " + args.head + " (int8 or same)")
 
 
 def main() raises:
@@ -840,24 +890,24 @@ def main() raises:
     elif args.dtype == "bf16":
         run[DenseMatrix[DType.bfloat16]](args)
     elif args.dtype == "int8-ch":
-        run[QuantMatrix[8, 0, False]](args)
+        run_quantized[QuantMatrix[8, 0, False]](args)
     elif args.dtype == "int8-ch-sym":
-        run[QuantMatrix[8, 0, True]](args)
+        run_quantized[QuantMatrix[8, 0, True]](args)
     elif args.dtype == "int4-ch":
-        run[QuantMatrix[4, 0, False]](args)
+        run_quantized[QuantMatrix[4, 0, False]](args)
     elif args.dtype == "int4-ch-sym":
-        run[QuantMatrix[4, 0, True]](args)
+        run_quantized[QuantMatrix[4, 0, True]](args)
     elif args.dtype == "int4-g128":
-        run[QuantMatrix[4, 128, False]](args)
+        run_quantized[QuantMatrix[4, 128, False]](args)
     elif args.dtype == "int4-g128-sym":
-        run[QuantMatrix[4, 128, True]](args)
+        run_quantized[QuantMatrix[4, 128, True]](args)
     elif args.dtype == "int4-g64":
-        run[QuantMatrix[4, 64, False]](args)
+        run_quantized[QuantMatrix[4, 64, False]](args)
     elif args.dtype == "int4-g64-sym":
-        run[QuantMatrix[4, 64, True]](args)
+        run_quantized[QuantMatrix[4, 64, True]](args)
     elif args.dtype == "int4-g32":
-        run[QuantMatrix[4, 32, False]](args)
+        run_quantized[QuantMatrix[4, 32, False]](args)
     elif args.dtype == "int4-g32-sym":
-        run[QuantMatrix[4, 32, True]](args)
+        run_quantized[QuantMatrix[4, 32, True]](args)
     else:
         raise Error("unknown --dtype " + args.dtype + " (see --help in PLAN.md)")

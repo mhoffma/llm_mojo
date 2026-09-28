@@ -49,7 +49,7 @@ accuracy each format costs for that speed**.
 | Probes: VNNI, float16/bfloat16 | ✅ done (`research/`) |
 | M1. Generic weight formats, float32 bit-identical to baseline | ✅ done |
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
-| M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | 🔄 f16/bf16, own int8/int4, GGUF with fast kernels done; our int4 with a higher-precision head next |
+| M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | 🔄 f16/bf16, GGUF with fast kernels, own int4 with int8 head (accuracy) done; fast kernels for our formats next |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ☐ |
 | M5. Tuning and final results table | ☐ |
 | M6. Stretch: pre-quantized weight files, int8 activations | ☐ |
@@ -110,6 +110,7 @@ Options (both programs; `--dtype` only in `gpt2t`):
 | Flag | Meaning | Default |
 |---|---|---|
 | `--dtype FMT` | weight format: `f32`, `f16`, `bf16`, `int8-ch`, `int4-ch`, `int4-g128`, `int4-g64`, `int4-g32`, each int format also with `-sym` | `f32` |
+| `--head FMT` | with an int `--dtype`: format of wte (embedding + output head), `int8` or `same` | `int8` |
 | `-m DIR` | directory with the Hugging Face files | `gpt2` |
 | `-n N` | tokens to generate | 64 |
 | `-t TEMP` | sampling temperature; `0` = greedy | 0.8 |
@@ -294,8 +295,20 @@ in a sweep.
   scale * u + min`, like llama.cpp's Q4_1; replaced 2026-09-28 because the
   integer form is the standard definition and keeps the M4 kernel's inner
   sums in integers.) Verified against NumPy (`tests/reference.py --quant`)
-  to 5-6 digits. Accuracy is still poor: int8 per-channel +3.3% perplexity,
-  int4 group 32 perplexity 353 (symmetric: 749). The cause is
+  to 5-6 digits.
+- **Output head at int8** (2026-09-28): `Model[W, E]` has a separate format
+  E for wte (the tied embedding and output head). For int layer formats it
+  defaults to `QuantMatrix[8, 0, False]` (int8, one scale and zero point per
+  vocabulary row); `--head same` quantizes it like the layers. This took
+  int4 group 32 from perplexity 352.6 to **25.59 (+1.2%)**, verified against
+  NumPy (`--quant 4,32,0 --quant-head 8,0,0`: 25.592098 vs 25.592096).
+  Asymmetric beats symmetric at every group size, and smaller groups are
+  better (see Results). By KL, int4-g32 + int8 head (0.147) sits between
+  GGUF Q4_0 (0.170) and Q4_K_M (0.098).
+- Our formats are still slow (int4-g32 decodes at ~25 tok/s): they use the
+  `[IN, OUT]` kernels, which dequantize through the generic `load`. Next:
+  give them the GGUF treatment (an `[OUT, IN]` block layout with SIMD fused
+  dot, or fast `[IN, OUT]` kernels). The cause is
   the output head: we quantize the tied `wte` together with everything else,
   while llama.cpp keeps GPT-2's output head at 6-bit (Q6_K). GGUF Q4_0, whose
   layer matrices use nearly our `int4-g32-sym` scheme, reaches 27.2 with its
@@ -483,12 +496,17 @@ Notes on f16 / bf16:
 | f32 (`gpt2t`) | 474 MB | same | same | 25.284 | 100% (bit-identical) | 0 |
 | f16 | 239 MB | 504–562 | 64–77 / 59–65 | 25.302 (+0.07%) | 99.67% | 1.7e-5 |
 | bf16 | 239 MB | 603–613 | 78–82 / 67–69 | 25.073 (−0.84%) | 95.13% | 7.4e-3 |
-| int8, per-channel (ours, head int8 too) | 121 MB | | | 26.116 (+3.29%) | | |
-| int4, per-channel (ours, head int4) | | | | | | |
-| int4, group 128 (ours, head int4) | | | | | | |
-| int4, group 64 (ours, head int4) | | | | | | |
-| int4, group 32 (ours, head int4) | | | | 352.6 | | |
-| int4, group 32, symmetric (ours, head int4) | | | | 748.7 | | |
+| int8, per-channel (ours, head int8) | 121 MB | 518 | 27 / 26 | 26.116 (+3.29%) | 81.6% | 4.6e-2 |
+| **int4, group 32 + int8 head (ours)** | 88 MB | 386 | 25 / 20 | **25.592 (+1.22%)** | 75.1% | 1.5e-1 |
+| int4, group 64 + int8 head (ours) | | | | 27.560 (+9.0%) | | |
+| int4, group 128 + int8 head (ours) | | | | 27.672 (+9.4%) | | |
+| int4, per-channel + int8 head (ours) | | | | 28.821 (+14.0%) | | |
+| int4, group 32 sym + int8 head (ours) | | | | 29.806 (+17.9%) | | |
+| int4, group 64 sym + int8 head (ours) | | | | 29.863 (+18.1%) | | |
+| int4, group 128 sym + int8 head (ours) | | | | 32.029 (+26.7%) | | |
+| int4, per-channel sym + int8 head (ours) | | | | 51.819 (+105%) | | |
+| int4, group 32, head int4 too (`--head same`) | | | | 352.6 | | |
+| int4, group 32 sym, head int4 too | | | | 748.7 | | |
 | GGUF Q8_0 (head Q6_K) | 167 MB | 574 | 63 / 56 | 25.416 (+0.52%) | 91.1% | 1.2e-2 |
 | GGUF Q4_0 (head Q6_K) | 99 MB | 710 | 80 / 79 | 27.178 (+7.49%) | 74.6% | 1.7e-1 |
 | GGUF Q4_K_M (Q4_K/Q5_K/Q6_K, head Q6_K) | 105 MB | 690 | 107 / 90 | 25.460 (+0.70%) | 80.2% | 9.8e-2 |

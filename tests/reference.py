@@ -17,6 +17,8 @@ the same matrices gpt2t quantizes (the four per-layer matrices and wte) with
 the same scheme as tensor.mojo's QuantMatrix: round-to-nearest, float16 scale
 and integer zero point per group along the reduction axis, GROUP 0 =
 per-channel, SYM 1 = symmetric. Use it to check `gpt2t_bin --dtype int...` independently.
+Add --quant-head BITS,GROUP,SYM to quantize wte (the tied embedding and
+output head) differently; gpt2t's default for int formats is 8,0,0.
 
 Add --gguf FILE to any mode to take the weights from a llama.cpp GGUF file
 instead (dequantized to float32 with the `gguf` package, so add
@@ -43,6 +45,7 @@ with open(MODEL, "rb") as f:
 BASE = 8 + n
 BUF = np.memmap(MODEL, dtype=np.uint8, mode="r")
 QUANT = None  # (bits, group, symmetric) when --quant is given
+QUANT_HEAD = None  # the same for wte (embedding and head), if --quant-head
 QUANTIZED = ("attn.c_attn.weight", "attn.c_proj.weight", "mlp.c_fc.weight",
              "mlp.c_proj.weight", "wte.weight")
 _cache = {}
@@ -114,7 +117,8 @@ def t(name):
     a, b = m["data_offsets"]
     w = np.frombuffer(BUF[BASE + a : BASE + b], dtype=np.float32).reshape(m["shape"])
     if QUANT and name.endswith(QUANTIZED):
-        w = fake_quant(w, *QUANT, reduce_rows=(name != "wte.weight"))
+        q = QUANT_HEAD if (name == "wte.weight" and QUANT_HEAD) else QUANT
+        w = fake_quant(w, *q, reduce_rows=(name != "wte.weight"))
         _cache[name] = w
     return w
 
@@ -183,6 +187,12 @@ def main():
         i = sys.argv.index("--quant")
         bits, group, sym = (int(v) for v in sys.argv[i + 1].split(","))
         QUANT = (bits, group, bool(sym))
+        del sys.argv[i : i + 2]
+    if "--quant-head" in sys.argv:
+        global QUANT_HEAD
+        i = sys.argv.index("--quant-head")
+        bits, group, sym = (int(v) for v in sys.argv[i + 1].split(","))
+        QUANT_HEAD = (bits, group, bool(sym))
         del sys.argv[i : i + 2]
     if "--quant-only" in sys.argv:
         global QUANTIZED
