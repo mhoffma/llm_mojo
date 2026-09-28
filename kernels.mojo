@@ -219,11 +219,21 @@ def attention[
             var sc = kv.score[HS](layer, s, h, q) * scale
             scores[unsafe_offset=s] = sc
             mx = max(mx, sc)
+        # Exponentials 16 at a time: SIMD exp gives exactly the scalar
+        # results lane by lane, and it's ~14x faster than one exp per call
+        # (research/test_softmax.mojo). The sum stays in the original order,
+        # so float32 results are unchanged bit for bit.
+        var s0 = 0
+        var mv = F32V(mx)
+        while s0 + NW <= npos:
+            scores.unsafe_store(s0, exp(scores.unsafe_load[width=NW](s0) - mv))
+            s0 += NW
+        while s0 < npos:
+            scores[unsafe_offset=s0] = exp(scores[unsafe_offset=s0] - mx)
+            s0 += 1
         var total = Float32(0)
         for s in range(npos):
-            var e = exp(scores[unsafe_offset=s] - mx)
-            scores[unsafe_offset=s] = e
-            total += e
+            total += scores[unsafe_offset=s]
         var o = out_.unsafe_offset(t * C + h * HS)
         var acc = Array[F32V, length = HS // NW](fill=F32V(0))
         for s in range(npos):

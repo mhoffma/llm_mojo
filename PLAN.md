@@ -487,10 +487,15 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.f
   | `f16` / `bf16` | `f16` / `bf16` |
   | int formats (float compute or `-a16`), `--gguf` | `int16` |
 
-- For `-a16` models with an int16 cache, attention can use VPDPWSSD too:
-  the query quantized to int16 once per step, `q · k` over 64 dimensions in
-  2 VPDPWSSDs scaled by `scale_q × scale_k[pos]`, and the value scale folded
-  into the softmax weight.
+- For `-a16` models with an int16 cache, attention can use integer
+  arithmetic too: the query quantized to int16 once per step, `q · k` over 64
+  dimensions scaled by `scale_q × scale_k[pos]`, and the value scale folded
+  into the softmax weight. **Correction (2026-09-28):** this can't use
+  VPDPWSSD with full-range int16 on both sides: one product reaches
+  32767² ≈ 1.07e9, and each int32 lane of a 64-element VPDPWSSD dot product
+  sums 4 of them (up to 4.3e9 > 2^31), wrapping silently. Safe options:
+  VPMADDWD with each pair sum converted to float right away (a pair sum is
+  at most 2,147,352,578 < 2^31), or a query with fewer bits (e.g. 8).
 
 | Cache | Per token | Full context | Read at position 476 |
 |---|---|---|---|
@@ -582,8 +587,30 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.f
      scales are enough; GPT-2's outlier channels don't break int8 keys.
      int16 stays the default for quantized weights; if step 5 shows a
      worthwhile speedup, int8 is a reasonable default too.
-4. Integer attention for `-a16` models with an int16 cache (VPDPWSSD), with
-   a unit test against exact math like `tests/a16_kernels.mojo`.
+4. Integer attention for `-a16` models with an int16 cache, with a unit test
+   against exact math like `tests/a16_kernels.mojo`. (Not VPDPWSSD with
+   full-range int16 queries: see the correction above. Attention's
+   exponentials were only a few percent of decode time, and the `q · k`
+   scores and value sums are most of attention's cost: measure with step 5
+   first.)
+
+**Softmax (2026-09-28, between steps 3 and 4).**
+- `research/test_softmax.mojo`: an integer `masked_softmax`
+  (softmax(x + mask) with e^x = 2^(x log2 e): shift for the integer part,
+  degree-3 polynomial for 2^-r, one reciprocal, Q15 output, rounding).
+  Accurate (max error ~1 Q15 step, KL 5.7e-4 vs exact) but slower on this
+  CPU (0.88 ns/element) than a SIMD float softmax (0.40), because of its
+  64-bit fixed-point multiplies. It would pay off only in an all-integer
+  attention, which also needs the scores in one shared scale.
+- The attention kernel's softmax used one scalar `exp` per score (5.8
+  ns/element). It now computes the exponentials 16 at a time with SIMD
+  `exp`, which gives exactly the scalar results lane by lane (checked on
+  3.2M values), and keeps the sum and the division in the original order,
+  so float32 stays bit-identical (`tests/same_as_baseline.sh` all `SAME`).
+  Effect: prompt processing ~5-10% faster for int4-g32-a16 (942-966 vs
+  813-911 tok/s, 3 interleaved rounds on a busy machine); decode within
+  noise. As estimated: at position 476 a decode step computes ~68K
+  exponentials, ~0.4 ms of ~9 ms before.
 5. Benchmark "decode long" with `tests/bench.sh`; update Results and the
    README.
 
