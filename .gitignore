@@ -1,0 +1,16 @@
+# Python / uv environment (recreate with `uv sync`)
+.venv/
+__pycache__/
+
+# Downloaded GPT-2 weights (see PLAN.md > Setup)
+gpt2/
+
+# Build outputs
+*_bin
+/aa
+*.s
+
+# Emacs auto-save, lock, and backup files
+\#*\#
+.\#*
+*~
