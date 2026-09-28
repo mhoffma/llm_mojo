@@ -23,6 +23,9 @@ Usage:
     -v           print prompt token ids and the top-5 next-token logits
     --head FMT   with an int --dtype: the tied embedding/output head's format,
                  int8 (default; int8, per vocabulary row) or same (as --dtype)
+    --kv FMT     KV cache format: auto (default: f32/f16/bf16 for those
+                 weights, int16 for quantized ones), f32, f16, bf16, int16,
+                 int8
     --gguf FILE  use the weights in a llama.cpp GGUF file of GPT-2 124M
                  (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 tensors), as
                  stored; overrides --dtype. The tokenizer still comes from -m.
@@ -45,7 +48,7 @@ from std.os import SEEK_END, SEEK_SET
 from tensor import FPtr, NW, F32V, WeightMatrix, DenseMatrix, QuantMatrix
 from max.algorithm import parallelize
 from kernels import linear, head, layernorm, attention, MAX_PARTS
-from kvcache import KVCache, DenseKV
+from kvcache import KVCache, DenseKV, QuantKV
 from gguf import GGUFFile, GGUFMatrix, BPtr, GGML_F32, type_name
 from tokenizer import Tokenizer, parse_uint, read_file_bytes
 
@@ -142,11 +145,19 @@ def read_safetensors(path: String, mut header: String) raises -> FPtr:
     return params
 
 
+trait LanguageModel:
+    """What the evaluation loop needs from a model."""
+
+    def forward_all(self, tokens: List[Int], logits: FPtr):
+        """Logits at every position of tokens (from position 0)."""
+        ...
+
+
 struct Model[
     W: WeightMatrix,
     E: WeightMatrix = W,
     KV: KVCache = DenseKV[DType.float32],
-](Movable):
+](LanguageModel, Movable):
     """GPT-2 with its layer matrices stored in format W, and its token
     embedding / output head (wte, lm) in format E, W by default.
 
@@ -343,8 +354,8 @@ comptime SMALL_FLOATS = N_LAYER * LAYER_VEC_FLOATS + MAX_T * C + 2 * C
 
 
 def load_model[
-    W: WeightMatrix, E: WeightMatrix = W
-](path: String) raises -> Model[W, E]:
+    W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.float32]
+](path: String) raises -> Model[W, E, KV]:
     """Loads Hugging Face float32 safetensors and converts the layer
     matrices to W and wte (the tied embedding and output head) to E."""
     var header = String()
@@ -368,7 +379,7 @@ def load_model[
     small.append(tensor(header, params, "wpe.weight"))
     small.append(tensor(header, params, "ln_f.weight"))
     small.append(tensor(header, params, "ln_f.bias"))
-    var model = Model[W, E](
+    var model = Model[W, E, KV](
         wte, wte, True, mats^, small, unsafe_alloc[UInt8](1)
     )
     params.unsafe_free()  # the model copied what it keeps
@@ -402,7 +413,9 @@ def gguf_f32(g: GGUFFile, name: String) raises -> FPtr:
     return m.data.unsafe_bitcast[Float32]()
 
 
-def load_gguf(path: String) raises -> Model[GGUFMatrix]:
+def load_gguf[
+    KV: KVCache = DenseKV[DType.float32]
+](path: String) raises -> Model[GGUFMatrix, GGUFMatrix, KV]:
     """Loads a llama.cpp GGUF file of GPT-2 124M, using its matrices as
     stored (quantized), without converting them."""
     var g = GGUFFile(path)
@@ -430,7 +443,9 @@ def load_gguf(path: String) raises -> Model[GGUFMatrix]:
     if wte.rows != V or wte.cols != C:
         raise Error("token_embd.weight has an unexpected shape")
     # The model takes over the file buffer: the matrices point into it.
-    return Model[GGUFMatrix](wte, lm, tied, mats^, small, g^.release())
+    return Model[GGUFMatrix, GGUFMatrix, KV](
+        wte, lm, tied, mats^, small, g^.release()
+    )
 
 
 def copy_into(dst: FPtr, mut off: Int, src: FPtr, n: Int) -> FPtr:
@@ -525,6 +540,7 @@ struct Args(Movable):
     var compare: Bool  # with ppl: also compare against float32
     var gguf: String  # GGUF weights file; overrides --dtype
     var head: String  # output head format for int formats: int8 or same
+    var kv: String  # KV cache format, or "auto" for the weights' default
 
     def __init__(out self) raises:
         self.dtype = "f32"
@@ -539,6 +555,7 @@ struct Args(Movable):
         self.compare = False
         self.gguf = ""
         self.head = "int8"
+        self.kv = "auto"
         var args = argv()
         var a = 1
         while a < len(args):
@@ -557,6 +574,8 @@ struct Args(Movable):
                     self.gguf = val
                 elif arg == "--head":
                     self.head = val
+                elif arg == "--kv":
+                    self.kv = val
                 elif arg == "-m":
                     self.dir = val
                 elif arg == "-n":
@@ -575,10 +594,12 @@ struct Args(Movable):
             a += 1
 
 
-def generate[W: WeightMatrix, E: WeightMatrix](args: Args) raises:
+def generate[
+    W: WeightMatrix, E: WeightMatrix, KV: KVCache
+](args: Args) raises:
     """Loads the model with weights in format W and generates text."""
     var t_load = perf_counter_ns()
-    var model = load[W, E](args)
+    var model = load[W, E, KV](args)
     var tok = Tokenizer(args.dir)
     var load_ms = Float64(perf_counter_ns() - t_load) / 1e6
 
@@ -628,7 +649,7 @@ def generate[W: WeightMatrix, E: WeightMatrix](args: Args) raises:
     print("\n---", file=FileDescriptor(2))
     print(
         "dtype",
-        model_name[W, E](),
+        model_name[W, E, KV](),
         "|",
         model.weight_bytes() // (1024 * 1024),
         "MB | load",
@@ -739,12 +760,8 @@ def score_rows[
 
 
 def eval_loop[
-    W: WeightMatrix,
-    E: WeightMatrix,
-    B: WeightMatrix,
-    BE: WeightMatrix,
-    COMPARE: Bool,
-](model: Model[W, E], base: Model[B, BE], ids: List[Int], name: String) raises:
+    M: LanguageModel, B: LanguageModel, //, COMPARE: Bool
+](model: M, base: B, ids: List[Int], name: String, fmt: String) raises:
     """Scores every token of ids after the first, in sliding windows.
 
     With COMPARE, also runs `base` (float32) on the same windows and compares
@@ -800,7 +817,7 @@ def eval_loop[
     )
     print(
         "  ",
-        model_name[W, E](),
+        fmt,
         "perplexity",
         ppl,
         " mean NLL",
@@ -811,7 +828,7 @@ def eval_loop[
         var ppl_b = exp(totals[NLL_BASE] / cnt)
         print("   f32 perplexity", ppl_b, " change", (ppl / ppl_b - 1) * 100, "%")
         print("   top-1 agreement with f32:", totals[AGREE] / cnt * 100, "%")
-        print("   mean KL(f32 || ", model_name[W, E](), "):", totals[KL] / cnt, "nats")
+        print("   mean KL(f32 || ", fmt, "):", totals[KL] / cnt, "nats")
         print(
             "   logit |diff| vs f32: mean", totals[DIFF_SUM] / (cnt * V),
             " max", diff_max,
@@ -821,7 +838,9 @@ def eval_loop[
     stats.unsafe_free()
 
 
-def evaluate[W: WeightMatrix, E: WeightMatrix](args: Args) raises:
+def evaluate[
+    W: WeightMatrix, E: WeightMatrix, KV: KVCache
+](args: Args) raises:
     """--ppl: perplexity of the text in args.ppl, and with --compare, how far
     format W's predictions are from float32's."""
     var tok = Tokenizer(args.dir)
@@ -829,30 +848,36 @@ def evaluate[W: WeightMatrix, E: WeightMatrix](args: Args) raises:
     var ids = tok.encode(text)
     if len(ids) < 2:
         raise Error("need at least 2 tokens in " + args.ppl)
-    var model = load[W, E](args)
+    var model = load[W, E, KV](args)
+    var fmt = model_name[W, E, KV]()
     if args.compare:
+        # The reference: float32 weights and a float32 KV cache.
         var base = load_model[F32](args.dir + "/model.safetensors")
-        eval_loop[W, E, F32, F32, True](model, base, ids, args.ppl)
+        eval_loop[True](model, base, ids, args.ppl, fmt)
     else:
         # Without COMPARE the baseline is never used; pass model itself.
-        eval_loop[W, E, W, E, False](model, model, ids, args.ppl)
+        eval_loop[False](model, model, ids, args.ppl, fmt)
 
 
-def load[W: WeightMatrix, E: WeightMatrix](args: Args) raises -> Model[W, E]:
-    """Loads the model for formats W and E: from --gguf for GGUF, otherwise
-    from the Hugging Face safetensors, converted."""
+def load[
+    W: WeightMatrix, E: WeightMatrix, KV: KVCache
+](args: Args) raises -> Model[W, E, KV]:
+    """Loads the model for formats W, E and KV: from --gguf for GGUF,
+    otherwise from the Hugging Face safetensors, converted."""
     comptime if W.FROM_GGUF:
         # W and E are GGUFMatrix here; rebind_var tells the compiler so.
-        return rebind_var[Model[W, E]](load_gguf(args.gguf))
+        return rebind_var[Model[W, E, KV]](load_gguf[KV](args.gguf))
     else:
-        return load_model[W, E](args.dir + "/model.safetensors")
+        return load_model[W, E, KV](args.dir + "/model.safetensors")
 
 
-def model_name[W: WeightMatrix, E: WeightMatrix]() -> String:
-    """The format's name, plus the head's when it differs."""
-    if W.name() == E.name():
-        return W.name()
-    return W.name() + "+head-" + E.name()
+def model_name[W: WeightMatrix, E: WeightMatrix, KV: KVCache]() -> String:
+    """The format's name, plus the head's when it differs, plus the KV
+    cache's."""
+    var n = W.name()
+    if W.name() != E.name():
+        n += "+head-" + E.name()
+    return n + "+kv-" + KV.name()
 
 
 comptime HEAD8 = QuantMatrix[8, 0, False]
@@ -862,11 +887,37 @@ comptime HEAD8_A16 = QuantMatrix[8, 0, False, True]
 """The same, computed in integers with int16 activations (for -a16 formats)."""
 
 
+def default_kv(weights: String) -> String:
+    """The KV cache format that matches a weight format's precision: float
+    formats keep their own type; quantized formats (ours and GGUF) use int16.
+    """
+    if weights == "f32" or weights == "f16" or weights == "bf16":
+        return weights
+    return "int16"
+
+
 def run[W: WeightMatrix, E: WeightMatrix = W](args: Args) raises:
-    if args.ppl.byte_length() > 0:
-        evaluate[W, E](args)
+    """Picks the KV cache format (--kv, or the default for W) and runs."""
+    var kv = default_kv(W.name()) if args.kv == "auto" else args.kv
+    if kv == "f32":
+        run_with[W, E, DenseKV[DType.float32]](args)
+    elif kv == "f16":
+        run_with[W, E, DenseKV[DType.float16]](args)
+    elif kv == "bf16":
+        run_with[W, E, DenseKV[DType.bfloat16]](args)
+    elif kv == "int16":
+        run_with[W, E, QuantKV[16]](args)
+    elif kv == "int8":
+        run_with[W, E, QuantKV[8]](args)
     else:
-        generate[W, E](args)
+        raise Error("unknown --kv " + kv + " (auto, f32, f16, bf16, int16, int8)")
+
+
+def run_with[W: WeightMatrix, E: WeightMatrix, KV: KVCache](args: Args) raises:
+    if args.ppl.byte_length() > 0:
+        evaluate[W, E, KV](args)
+    else:
+        generate[W, E, KV](args)
 
 
 def run_quantized[W: WeightMatrix](args: Args) raises:

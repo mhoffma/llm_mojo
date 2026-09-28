@@ -168,6 +168,7 @@ Timing and model size are printed to stderr after the generated text.
 |---|---|---|
 | `--dtype FMT` | weight format of the layer matrices (see below) | `f32` |
 | `--head FMT` | with an int `--dtype`: format of `wte` (embedding + output head), `int8` or `same` | `int8` |
+| `--kv FMT` | KV cache format: `auto`, `f32`, `f16`, `bf16`, `int16`, `int8` (see [KV cache](#the-kv-cache)) | `auto` |
 | `--gguf FILE` | use a llama.cpp GGUF file of GPT-2 124M, as stored; overrides `--dtype` | |
 | `-m DIR` | directory with `model.safetensors`, `vocab.json`, `merges.txt` | `gpt2` |
 | `-n N` | tokens to generate | 64 |
@@ -207,7 +208,29 @@ GPT-2 124M has 12 transformer blocks, hidden size C = 768, 12 attention heads of
 
 The five large matrices are about 99% of the bytes read per token; `wte` alone is about 30%, because it's also the output head. `Model[W, E]` takes the layer format `W` and the embedding/head format `E`, which defaults to `W`. GGUF files store a separate, untied output head, which the model holds as its own field (`lm`).
 
-Activations, the residual stream, attention and the KV cache (12 layers × 1024 positions × 768) are always float32. The `-a16` formats quantize only the *inputs* of the matmuls to int16.
+Activations, the residual stream and attention arithmetic are float32. The `-a16` formats quantize only the *inputs* of the matmuls to int16. The KV cache has its own format; see [the KV cache](#the-kv-cache).
+
+### The KV cache
+
+For every layer, the cache holds each past token's key and value vectors, `[layer, position, head, 64]`. Each new token's attention compares its query with every cached key, and adds up the cached values weighted by the softmax of those scores. In float32 that's 72 KB per token and 75.5 MB for a full 1,024-token context. Once the weights are small, reading the cache is a large share of long-context decoding: at position 476, int4-g32-a16 reads ~87 MB of weights plus 35 MB of float32 cache per token.
+
+Like the weights, the cache format is a trait, `KVCache` in `kvcache.mojo`. The attention kernel is generic over it, and it's the model's third format parameter, `Model[W, E, KV]`:
+
+| `--kv` | Stores | Per token |
+|---|---|---|
+| `f32` | float32 | 72 KB |
+| `f16`, `bf16` | 16-bit floats, widened when read | 36 KB |
+| `int16`, `int8` | symmetric integers, one float32 scale per (layer, position, head) for keys and one for values | ~37 KB, ~19 KB |
+
+- **The default, `auto`, matches the model's precision.** f32, f16 and bf16 weights keep their own type, and quantized weights (ours and GGUF) get int16.
+- **For the integer caches:**
+  - `store` quantizes each head's 64 values when a token is added.
+  - `score` applies the key's scale once per dot product.
+  - `add_value` folds the value's scale into the softmax weight, so there's no per-element scaling.
+
+With float32 weights, the cache format alone changes perplexity by at most 0.1%: f16 −0.002%, bf16 −0.10%, int16 0.000%, int8 +0.09%. These are verified against NumPy (`tests/reference.py --kv`).
+
+Note: the int and GGUF results in the tables above were measured with a float32 cache, before the int16 default existed. `--kv f32` reproduces them.
 
 ### The `WeightMatrix` trait
 
@@ -357,7 +380,7 @@ Build `gpt2t_bin` (and `gpt2_bin` for the first check) before running these:
 |---|---|
 | float32 through the generic code is bit-identical to the baseline | `tests/same_as_baseline.sh` |
 | Logits, greedy decoding and perplexity match a NumPy GPT-2 | `uv run --with tiktoken python tests/reference.py {logits,greedy,ppl} ...` |
-| Our quantization matches NumPy (add `--quant BITS,GROUP,SYM`, `--quant-head`, `--act16`) | `uv run --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --quant 4,32,0 --quant-head 8,0,0` |
+| Our quantization matches NumPy (add `--quant BITS,GROUP,SYM`, `--quant-head`, `--act16`, `--kv FMT`) | `uv run --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --quant 4,32,0 --quant-head 8,0,0` |
 | GGUF dequantization matches llama.cpp's Python `gguf` package | `uv run --with gguf python tests/gguf_check.py gpt2/gguf/gpt2.Q4_K_M.gguf` |
 | GGUF perplexity matches NumPy | `uv run --with gguf --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt --gguf FILE` |
 | Integer kernels match exact float64 math, including worst-case overflow inputs | `uv run mojo run -I . tests/a16_kernels.mojo` |
@@ -385,6 +408,7 @@ Current results:
 | `tensor.mojo` | The `WeightMatrix` trait, `DenseMatrix`, `QuantMatrix`, `dot_pairs` (VNNI) |
 | `gguf.mojo` | GGUF reader, `GGUFMatrix`, SIMD dequantizers for six block formats |
 | `kernels.mojo` | matmul, GEMV, `matmul_rows`, `matmul_rows_a16`, register tiles, LayerNorm, attention, output head |
+| `kvcache.mojo` | The `KVCache` trait and its formats, `DenseKV` and `QuantKV` |
 | `tokenizer.mojo` | GPT-2 byte-level BPE tokenizer |
 | `gpt2.mojo` | The original single-file float32 program: the frozen reference |
 | `tests/` | NumPy reference, tokenizer check, GGUF checks, kernel tests, baseline comparison, benchmark script, evaluation text |

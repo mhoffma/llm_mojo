@@ -21,6 +21,9 @@ Add --quant-head BITS,GROUP,SYM to quantize wte (the tied embedding and
 output head) differently; gpt2t's default for int formats is 8,0,0.
 Add --act16 to also fake-quantize every matmul input to int16 (symmetric, one
 scale per token row), as gpt2t's -a16 formats do.
+Add --kv FMT (f16, bf16, int16, int8) to round the attention keys and values
+the way gpt2t's KV cache formats store them (kvcache.mojo): 16-bit floats,
+or symmetric integers with one scale per position and head.
 
 Add --gguf FILE to any mode to take the weights from a llama.cpp GGUF file
 instead (dequantized to float32 with the `gguf` package, so add
@@ -49,6 +52,28 @@ BUF = np.memmap(MODEL, dtype=np.uint8, mode="r")
 QUANT = None  # (bits, group, symmetric) when --quant is given
 QUANT_HEAD = None  # the same for wte (embedding and head), if --quant-head
 ACT16 = False  # --act16: quantize matmul inputs to int16 per row
+KV = None  # --kv: the KV cache format to simulate
+
+
+def to_bf16(x):
+    """Rounds float32 to bfloat16 (round to nearest even) and back."""
+    b = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
+    b = (b + (((b >> 16) & 1) + 0x7FFF)) & 0xFFFF0000
+    return b.astype(np.uint32).view(np.float32)
+
+
+def kvq(x):
+    """Rounds keys or values ([heads, T, 64]) like kvcache.mojo stores them."""
+    if KV is None or KV == "f32":
+        return x
+    if KV == "f16":
+        return x.astype(np.float16).astype(np.float32)
+    if KV == "bf16":
+        return to_bf16(x)
+    qmax = {"int16": 32767, "int8": 127}[KV]
+    s = np.abs(x).max(axis=-1, keepdims=True).astype(np.float32) / qmax
+    s = np.where(s == 0, 1, s)
+    return (np.round(x * (1 / s)) * s).astype(np.float32)
 
 
 def aq(x):
@@ -156,6 +181,7 @@ def forward(toks, all_positions=False):
         a = aq(ln(x, t(p + "ln_1.weight"), t(p + "ln_1.bias"))) @ t(p + "attn.c_attn.weight")
         a = a + t(p + "attn.c_attn.bias")
         q, k, v = (z.reshape(T, 12, 64).transpose(1, 0, 2) for z in np.split(a, 3, axis=-1))
+        k, v = kvq(k), kvq(v)
         s = q @ k.transpose(0, 2, 1) / 8.0
         s = s + np.triu(np.full((T, T), -1e10, dtype=np.float32), 1)
         s = np.exp(s - s.max(-1, keepdims=True))
@@ -189,7 +215,11 @@ def perplexity(ids, window=1024, stride=512):
 
 
 def main():
-    global QUANT, GGUF, ACT16
+    global QUANT, GGUF, ACT16, KV
+    if "--kv" in sys.argv:
+        i = sys.argv.index("--kv")
+        KV = sys.argv[i + 1]
+        del sys.argv[i : i + 2]
     if "--act16" in sys.argv:
         ACT16 = True
         sys.argv.remove("--act16")

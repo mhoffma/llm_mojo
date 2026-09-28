@@ -51,7 +51,7 @@ accuracy each format costs for that speed**.
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
-| M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) | 🔄 step 1 done (trait + float32, bit-identical); step 2 (f16/bf16/int16/int8 + `--kv`) next |
+| M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) | 🔄 steps 1-2 done (all formats, `--kv`, defaults, NumPy check); step 3 (accuracy with `--compare`) next |
 | M6. Tuning and final results table | ☐ |
 | M7. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
@@ -112,6 +112,7 @@ Options (both programs; `--dtype` only in `gpt2t`):
 |---|---|---|
 | `--dtype FMT` | weight format: `f32`, `f16`, `bf16`, `int8-ch`, `int4-ch`, `int4-g128`, `int4-g64`, `int4-g32`, each int format also with `-sym` | `f32` |
 | `--head FMT` | with an int `--dtype`: format of wte (embedding + output head), `int8` or `same` | `int8` |
+| `--kv FMT` | KV cache format: `auto` (f32/f16/bf16 weights keep their type, quantized weights get `int16`), `f32`, `f16`, `bf16`, `int16`, `int8` | `auto` |
 | `-m DIR` | directory with the Hugging Face files | `gpt2` |
 | `-n N` | tokens to generate | 64 |
 | `-t TEMP` | sampling temperature; `0` = greedy | 0.8 |
@@ -158,7 +159,7 @@ users can install Modular's Mojo extension.
 | `tensor.mojo` | The `WeightMatrix` trait and our formats: `DenseMatrix[dtype]`, `QuantMatrix[bits, group, symmetric, a16]` |
 | `gguf.mojo` | GGUF file reader and `GGUFMatrix`: dequantizes Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 |
 | `kernels.mojo` | matmul (prefill), GEMV (decode), `matmul_rows` for `[OUT, IN]` weights, LayerNorm, attention, output head; generic over `W: WeightMatrix` |
-| `kvcache.mojo` | The `KVCache` trait and its formats (`DenseKV[dtype]` so far) |
+| `kvcache.mojo` | The `KVCache` trait and its formats: `DenseKV[dtype]`, `QuantKV[bits]` |
 | `tokenizer.mojo` | GPT-2 byte-level BPE tokenizer (reads `vocab.json`, `merges.txt`) |
 | `tests/` | Correctness checks and the accuracy harness's reference (see below); `tests/data/` holds the evaluation text |
 | `research/` | Small commented probe programs, each answering one question; see `research/README.md` |
@@ -516,9 +517,34 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.f
      it: f32 decode long 47 vs 51 median in one set, both ~20-25 under
      load in the next). Same loads and arithmetic as before; only the
      address computation moved into the inlined trait method.
-2. `DenseKV[f16/bf16]` and `QuantKV[16/8]` with float arithmetic; `--kv`
+2. ✅ `DenseKV[f16/bf16]` and `QuantKV[16/8]` with float arithmetic; `--kv`
    flag and defaults; a `--kv` fake-quantization option in
    `tests/reference.py` to verify them against NumPy.
+   - Done (2026-09-28): `QuantKV[BITS]` stores int16/int8 codes with one
+     float32 scale per (layer, position, head) for keys and for values,
+     symmetric (scale = max|x| / 32767 or 127), quantized in `store`;
+     `score` applies the key scale once per dot product and `add_value`
+     folds the value scale into the softmax weight.
+   - `--kv auto|f32|f16|bf16|int16|int8`; `auto` = `default_kv`: f32, f16,
+     bf16 weights keep their own type, quantized weights (ours and GGUF) get
+     int16. The format shows in the model name (`...+kv-int16`). **This
+     changes the default for int and GGUF formats** (before: float32 cache);
+     `--kv f32` reproduces the earlier behavior and results.
+   - `eval_loop` now takes any `LanguageModel` (a trait with `forward_all`)
+     instead of spelling out model type parameters.
+   - Every weight format × head choice is now compiled with all 5 cache
+     formats: the build takes ~73 s (was ~35 s).
+   - Mojo vs NumPy (`tests/reference.py --kv FMT`), float32 weights:
+
+     | KV cache | Mojo | NumPy | vs f32 cache |
+     |---|---|---|---|
+     | f16 | 25.28377 | 25.28309 | −0.002% |
+     | bf16 | 25.25819 | 25.26033 | −0.10% |
+     | int16 | 25.28430 | 25.28434 | 0.000% |
+     | int8 | 25.30679 | 25.30853 | +0.09% |
+
+     Agreement ~1e-4 relative, like A16: coarse rounding turns tiny
+     differences in computed keys into occasional different codes.
 3. Accuracy: `--ppl --compare` for each cache format, with float32 weights
    (the cache's error alone) and with the quantized weight formats. The
    Alice windows reach 1,024 tokens, so the whole cache is exercised.
