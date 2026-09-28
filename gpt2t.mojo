@@ -9,7 +9,7 @@ Usage:
     mojo run gpt2t.mojo [--dtype FMT] [-m DIR] [-n TOKENS] [-t TEMP] [-k TOPK]
                         [-s SEED] [-v] "prompt"
 
-    --dtype FMT  weight format: f32 (default)
+    --dtype FMT  weight format: f32 (default), f16, bf16
     -m DIR       directory with the Hugging Face GPT-2 files (default: gpt2)
     -n TOKENS    number of tokens to generate (default: 64)
     -t TEMP      sampling temperature; 0 = greedy (default: 0.8)
@@ -26,13 +26,21 @@ biases, and the position embedding wpe stay float32.
 from std.memory.alloc import unsafe_alloc
 from std.sys import argv
 from std.time import perf_counter_ns
-from std.math import exp
+from std.math import exp, log
 from std.io import FileDescriptor
 from std.os import SEEK_END, SEEK_SET
 
 from tensor import FPtr, NW, F32V, WeightMatrix, DenseMatrix
-from kernels import matmul, layernorm, attention, lm_head, MAX_PARTS
-from tokenizer import Tokenizer, parse_uint
+from max.algorithm import parallelize
+from kernels import (
+    matmul,
+    layernorm,
+    attention,
+    lm_head,
+    lm_head_rows,
+    MAX_PARTS,
+)
+from tokenizer import Tokenizer, parse_uint, read_file_bytes
 
 # GPT-2 small hyperparameters.
 comptime N_LAYER = 12
@@ -222,6 +230,23 @@ struct Model[W: WeightMatrix](Movable):
     def forward(self, tokens: List[Int], pos0: Int) -> FPtr:
         """Runs tokens at positions pos0.. and returns the last token's logits.
         """
+        self.blocks(tokens, pos0)
+        var last = self.x.unsafe_offset((len(tokens) - 1) * C)
+        layernorm[C](self.xn, last, self.lnf_w, self.lnf_b, 1)
+        lm_head(self.logits, self.xn, self.wte, V, C)
+        return self.logits
+
+    def forward_all(self, tokens: List[Int], logits: FPtr):
+        """Runs tokens from position 0 and writes logits for every position
+        into logits[T, V]. Row t predicts tokens[t + 1]."""
+        var T = len(tokens)
+        self.blocks(tokens, 0)
+        layernorm[C](self.xn, self.x, self.lnf_w, self.lnf_b, T)
+        lm_head_rows(logits, self.xn, self.wte, T, V, C)
+
+    def blocks(self, tokens: List[Int], pos0: Int):
+        """Embeds tokens at positions pos0.. and runs all transformer blocks,
+        leaving the result in self.x and filling the KV cache."""
         var T = len(tokens)
         var x = self.x
         var xn = self.xn
@@ -297,11 +322,6 @@ struct Model[W: WeightMatrix](Movable):
                 C,
                 self.scratch,
             )
-
-        var last = x.unsafe_offset((T - 1) * C)
-        layernorm[C](xn, last, self.lnf_w, self.lnf_b, 1)
-        lm_head(self.logits, xn, self.wte, V, C)
-        return self.logits
 
 
 def copy_into(dst: FPtr, mut off: Int, src: FPtr, n: Int) -> FPtr:
@@ -392,6 +412,8 @@ struct Args(Movable):
     var seed: Int
     var verbose: Bool
     var prompt: String
+    var ppl: String  # evaluation text file; empty = generate instead
+    var compare: Bool  # with ppl: also compare against float32
 
     def __init__(out self) raises:
         self.dtype = "f32"
@@ -402,16 +424,22 @@ struct Args(Movable):
         self.seed = 1337
         self.verbose = False
         self.prompt = "The meaning of life is"
+        self.ppl = ""
+        self.compare = False
         var args = argv()
         var a = 1
         while a < len(args):
             var arg = String(args[a])
             if arg == "-v":
                 self.verbose = True
+            elif arg == "--compare":
+                self.compare = True
             elif arg.startswith("-") and a + 1 < len(args):
                 var val = String(args[a + 1])
                 if arg == "--dtype":
                     self.dtype = val
+                elif arg == "--ppl":
+                    self.ppl = val
                 elif arg == "-m":
                     self.dir = val
                 elif arg == "-n":
@@ -430,7 +458,7 @@ struct Args(Movable):
             a += 1
 
 
-def run[W: WeightMatrix](args: Args) raises:
+def generate[W: WeightMatrix](args: Args) raises:
     """Loads the model with weights in format W and generates text."""
     var t_load = perf_counter_ns()
     var model = Model[W](args.dir + "/model.safetensors")
@@ -505,11 +533,201 @@ def run[W: WeightMatrix](args: Args) raises:
     )
 
 
+# ===----------------------------------------------------------------------=== #
+# Evaluation
+# ===----------------------------------------------------------------------=== #
+
+comptime F32 = DenseMatrix[DType.float32]
+comptime EVAL_WINDOW = MAX_T
+comptime EVAL_STRIDE = 512
+
+# Per-position results, one array of each per window row.
+comptime NLL = 0  # -log p(target) under the model being evaluated
+comptime NLL_BASE = 1  # the same under float32 (compare mode)
+comptime AGREE = 2  # 1 if both models' top-1 predictions are equal
+comptime KL = 3  # KL(float32 || model), in nats
+comptime DIFF_MAX = 4  # largest |logit difference| over the vocabulary
+comptime DIFF_SUM = 5  # sum of |logit differences| over the vocabulary
+comptime N_STATS = 6
+
+
+@always_inline
+def log_sum_exp(row: FPtr) -> Float64:
+    """Returns log(sum(exp(row[v]))) over the vocabulary, computed stably."""
+    var mx = row[unsafe_offset=0]
+    for v in range(1, V):
+        mx = max(mx, row[unsafe_offset=v])
+    var s = Float64(0)
+    for v in range(V):
+        s += Float64(exp(row[unsafe_offset=v] - mx))
+    return Float64(mx) + log(s)
+
+
+def score_rows[
+    COMPARE: Bool
+](
+    stats: Pointer[Float64, MutUntrackedOrigin],
+    logits: FPtr,
+    base: FPtr,
+    targets: List[Int],
+    r0: Int,
+    r1: Int,
+):
+    """Fills stats[k * MAX_T + r] for window rows r0..r1-1.
+
+    Row r's logits predict targets[r]. Rows are independent, so they are
+    scored in parallel.
+    """
+    var tp = targets.unsafe_ptr()
+
+    def row(i: Int) {imm}:
+        var r = r0 + i
+        var lm = logits.unsafe_offset(r * V)
+        var target = tp[unsafe_offset=r]
+        var lse = log_sum_exp(lm)
+        stats[unsafe_offset = NLL * MAX_T + r] = lse - Float64(
+            lm[unsafe_offset=target]
+        )
+        comptime if COMPARE:
+            var lb = base.unsafe_offset(r * V)
+            var lse_b = log_sum_exp(lb)
+            var kl = Float64(0)
+            var dmax = Float64(0)
+            var dsum = Float64(0)
+            var best = 0
+            var best_b = 0
+            for v in range(V):
+                var m = lm[unsafe_offset=v]
+                var b = lb[unsafe_offset=v]
+                var lpb = Float64(b) - lse_b
+                kl += exp(lpb) * (lpb - (Float64(m) - lse))
+                var d = abs(Float64(m) - Float64(b))
+                dmax = max(dmax, d)
+                dsum += d
+                if m > lm[unsafe_offset=best]:
+                    best = v
+                if b > lb[unsafe_offset=best_b]:
+                    best_b = v
+            stats[unsafe_offset = NLL_BASE * MAX_T + r] = lse_b - Float64(
+                lb[unsafe_offset=target]
+            )
+            stats[unsafe_offset = AGREE * MAX_T + r] = Float64(
+                Int(best == best_b)
+            )
+            stats[unsafe_offset = KL * MAX_T + r] = kl
+            stats[unsafe_offset = DIFF_MAX * MAX_T + r] = dmax
+            stats[unsafe_offset = DIFF_SUM * MAX_T + r] = dsum
+
+    parallelize(row, r1 - r0)
+
+
+def eval_loop[
+    W: WeightMatrix, B: WeightMatrix, COMPARE: Bool
+](model: Model[W], base: Model[B], ids: List[Int], name: String) raises:
+    """Scores every token of ids after the first, in sliding windows.
+
+    With COMPARE, also runs `base` (float32) on the same windows and compares
+    the two models' predictions position by position.
+
+    Windows are EVAL_WINDOW tokens long and start every EVAL_STRIDE tokens,
+    and each token is scored once, in the first window where it isn't
+    already scored. So apart from the first window, every scored token
+    has at least EVAL_WINDOW - EVAL_STRIDE tokens of context.
+    """
+    var logits = unsafe_alloc[Float32](EVAL_WINDOW * V)
+    var base_logits = unsafe_alloc[Float32](EVAL_WINDOW * V) if COMPARE else logits
+    var stats = unsafe_alloc[Float64](N_STATS * MAX_T)
+    var totals = List[Float64](length=N_STATS, fill=0)
+    var diff_max = Float64(0)
+    var scored = 0
+    var windows = 0
+    var n = len(ids)
+    var scored_until = 0  # ids[1 .. scored_until] have been scored
+    var begin = 0
+    var t0 = perf_counter_ns()
+    while True:
+        var end = min(begin + EVAL_WINDOW, n)
+        var window = List[Int](capacity=end - begin)
+        var targets = List[Int](capacity=end - begin)
+        for i in range(begin, end):
+            window.append(ids[i])
+            targets.append(ids[i + 1] if i + 1 < n else 0)
+        model.forward_all(window, logits)
+        comptime if COMPARE:
+            base.forward_all(window, base_logits)
+        # Row r predicts ids[begin + r + 1]; score only targets not yet seen.
+        var r0 = max(0, scored_until - begin)
+        var r1 = end - begin - 1
+        score_rows[COMPARE](stats, logits, base_logits, targets, r0, r1)
+        for r in range(r0, r1):
+            for k in range(N_STATS):
+                totals[k] += stats[unsafe_offset = k * MAX_T + r]
+            diff_max = max(diff_max, stats[unsafe_offset = DIFF_MAX * MAX_T + r])
+        scored += r1 - r0
+        scored_until = end - 1
+        windows += 1
+        if end == n:
+            break
+        begin += EVAL_STRIDE
+    var secs = Float64(perf_counter_ns() - t0) / 1e9
+
+    var cnt = Float64(scored)
+    var ppl = exp(totals[NLL] / cnt)
+    print(
+        name, ":", scored, "tokens scored in", windows, "windows of",
+        EVAL_WINDOW, "(stride", EVAL_STRIDE, ") in", secs, "s",
+    )
+    print("  ", W.NAME, "perplexity", ppl, " mean NLL", totals[NLL] / cnt, "nats")
+    comptime if COMPARE:
+        var ppl_b = exp(totals[NLL_BASE] / cnt)
+        print("   f32 perplexity", ppl_b, " change", (ppl / ppl_b - 1) * 100, "%")
+        print("   top-1 agreement with f32:", totals[AGREE] / cnt * 100, "%")
+        print("   mean KL(f32 || ", W.NAME, "):", totals[KL] / cnt, "nats")
+        print(
+            "   logit |diff| vs f32: mean", totals[DIFF_SUM] / (cnt * V),
+            " max", diff_max,
+        )
+        base_logits.unsafe_free()
+    logits.unsafe_free()
+    stats.unsafe_free()
+
+
+def evaluate[W: WeightMatrix](args: Args) raises:
+    """--ppl: perplexity of the text in args.ppl, and with --compare, how far
+    format W's predictions are from float32's."""
+    var tok = Tokenizer(args.dir)
+    var text = String(from_utf8_lossy=Span(read_file_bytes(args.ppl)))
+    var ids = tok.encode(text)
+    if len(ids) < 2:
+        raise Error("need at least 2 tokens in " + args.ppl)
+    var path = args.dir + "/model.safetensors"
+    var model = Model[W](path)
+    if args.compare:
+        var base = Model[F32](path)
+        eval_loop[W, F32, True](model, base, ids, args.ppl)
+    else:
+        # Without COMPARE the baseline is never used; pass model itself.
+        eval_loop[W, W, False](model, model, ids, args.ppl)
+
+
+def run[W: WeightMatrix](args: Args) raises:
+    if args.ppl.byte_length() > 0:
+        evaluate[W](args)
+    else:
+        generate[W](args)
+
+
 def main() raises:
     var args = Args()
     # Each branch instantiates the whole program for one format, at compile
     # time. Adding a format is one more line here.
     if args.dtype == "f32":
         run[DenseMatrix[DType.float32]](args)
+    elif args.dtype == "f16":
+        run[DenseMatrix[DType.float16]](args)
+    elif args.dtype == "bf16":
+        run[DenseMatrix[DType.bfloat16]](args)
     else:
-        raise Error("unknown --dtype " + args.dtype + " (supported: f32)")
+        raise Error(
+            "unknown --dtype " + args.dtype + " (supported: f32, f16, bf16)"
+        )

@@ -240,3 +240,47 @@ def lm_head[W: WeightMatrix, //](logits: FPtr, h: FPtr, wte: W, V: Int, C: Int):
             logits[unsafe_offset=v] = d.reduce_add()
 
     parallelize(chunk, nchunks)
+
+
+def lm_head_rows[
+    W: WeightMatrix, //
+](logits: FPtr, h: FPtr, wte: W, T: Int, V: Int, C: Int):
+    """Computes logits[T, V] = h[T, C] @ wte[V, C]^T, for every position.
+
+    Used for evaluation (perplexity), which needs a prediction at each
+    position, not just the last. Each wte row is loaded once and dotted with
+    4 rows of h at a time.
+    """
+    comptime CHUNK = 64
+    var nchunks = (V + CHUNK - 1) // CHUNK
+
+    def chunk(ci: Int) {imm}:
+        var end = min(V, (ci + 1) * CHUNK)
+        for v in range(ci * CHUNK, end):
+            var t = 0
+            while t + 4 <= T:
+                var d0 = F32V(0)
+                var d1 = F32V(0)
+                var d2 = F32V(0)
+                var d3 = F32V(0)
+                var h0 = h.unsafe_offset(t * C)
+                for i in range(0, C, NW):
+                    var w = wte.load[NW](v, i)
+                    d0 = h0.unsafe_load[width=NW](i).fma(w, d0)
+                    d1 = h0.unsafe_load[width=NW](C + i).fma(w, d1)
+                    d2 = h0.unsafe_load[width=NW](2 * C + i).fma(w, d2)
+                    d3 = h0.unsafe_load[width=NW](3 * C + i).fma(w, d3)
+                logits[unsafe_offset = t * V + v] = d0.reduce_add()
+                logits[unsafe_offset = (t + 1) * V + v] = d1.reduce_add()
+                logits[unsafe_offset = (t + 2) * V + v] = d2.reduce_add()
+                logits[unsafe_offset = (t + 3) * V + v] = d3.reduce_add()
+                t += 4
+            while t < T:
+                var d = F32V(0)
+                var ht = h.unsafe_offset(t * C)
+                for i in range(0, C, NW):
+                    d = ht.unsafe_load[width=NW](i).fma(wte.load[NW](v, i), d)
+                logits[unsafe_offset = t * V + v] = d.reduce_add()
+                t += 1
+
+    parallelize(chunk, nchunks)

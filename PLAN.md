@@ -48,8 +48,8 @@ accuracy each format costs for that speed**.
 |---|---|
 | Probes: VNNI, float16/bfloat16 | ✅ done (`research/`) |
 | M1. Generic weight formats, float32 bit-identical to baseline | ✅ done |
-| M2. Accuracy harness (perplexity, logit comparison) | ⏭ next |
-| M3. float16 / bfloat16, then int4 (and int8) weights with float32 compute | ☐ |
+| M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
+| M3. float16 / bfloat16, then int4 (and int8) weights with float32 compute | 🔄 f16/bf16 done; int4/int8 next |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ☐ |
 | M5. Tuning and final results table | ☐ |
 | M6. Stretch: pre-quantized weight files, int8 activations | ☐ |
@@ -98,13 +98,15 @@ Options (both programs; `--dtype` only in `gpt2t`):
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--dtype FMT` | weight format: `f32` (more per milestone) | `f32` |
+| `--dtype FMT` | weight format: `f32`, `f16`, `bf16` (more per milestone) | `f32` |
 | `-m DIR` | directory with the Hugging Face files | `gpt2` |
 | `-n N` | tokens to generate | 64 |
 | `-t TEMP` | sampling temperature; `0` = greedy | 0.8 |
 | `-k K` | top-k sampling; `0` = all tokens | 40 |
 | `-s SEED` | random seed | 1337 |
 | `-v` | print prompt token ids and the top-5 next-token logits | off |
+| `--ppl FILE` | instead of generating, measure perplexity on a text file (`gpt2t` only) | |
+| `--compare` | with `--ppl`: also run float32 and compare predictions (`gpt2t` only) | off |
 
 Timing and model size are printed to stderr after the generated text.
 
@@ -141,7 +143,7 @@ users can install Modular's Mojo extension.
 | `tensor.mojo` | The `WeightMatrix` trait and the formats (`DenseMatrix[dtype]` so far) |
 | `kernels.mojo` | matmul (prefill), GEMV (decode), LayerNorm, attention, output head; generic over `W: WeightMatrix` |
 | `tokenizer.mojo` | GPT-2 byte-level BPE tokenizer (reads `vocab.json`, `merges.txt`) |
-| `tests/` | Correctness checks (see below) |
+| `tests/` | Correctness checks and the accuracy harness's reference (see below); `tests/data/` holds the evaluation text |
 | `research/` | Small commented probe programs, each answering one question; see `research/README.md` |
 | `gpt2/` | Downloaded weights (not source) |
 | `pyproject.toml`, `uv.lock` | The pinned environment |
@@ -155,11 +157,38 @@ users can install Modular's Mojo extension.
 | Logits match an independent NumPy GPT-2 | `uv run python tests/reference.py logits 15496,11,616,1438,318` vs `./gpt2t_bin -v -n 0 "Hello, my name is"` | top-5 agree to ~1e-5 |
 | Greedy decoding (KV cache path) matches NumPy | `uv run --with tiktoken python tests/reference.py greedy <ids> 30` vs `./gpt2t_bin -t 0 -n 30 "<prompt>"` | identical text |
 | Tokenizer matches tiktoken | `uv run --with tiktoken python tests/tokenizer_vs_tiktoken.py` | `mismatches: 0` |
+| Perplexity matches NumPy | `uv run --with tiktoken python tests/reference.py ppl tests/data/alice_ch1.txt` vs `./gpt2t_bin --ppl tests/data/alice_ch1.txt` | same to ~6 digits (25.2843) |
 
 Build both binaries before running these. Run `tests/same_as_baseline.sh`
 after any change to `gpt2t.mojo`, `kernels.mojo`, or `tensor.mojo`: float32
-must stay bit-identical. Lossy formats are checked with the M2 accuracy
-harness instead.
+must stay bit-identical. Lossy formats are checked with the accuracy harness
+instead.
+
+### Accuracy harness
+
+```sh
+./gpt2t_bin --dtype FMT --ppl tests/data/alice_ch1.txt --compare
+```
+
+Evaluation text: `tests/data/alice_ch1.txt`, Chapter I of *Alice's
+Adventures in Wonderland* (public domain; Project Gutenberg eBook #11 with
+the Gutenberg header and license removed), 3,308 GPT-2 tokens.
+
+The text is scored in sliding windows of 1024 tokens starting every 512, and
+each token is scored once, in the first window that contains its prediction,
+so every scored token after the first window has at least 512 tokens of
+context. `--compare` loads a float32 model too, runs both on the same
+windows, and reports, over the 3,307 scored positions:
+
+| Metric | Meaning |
+|---|---|
+| perplexity | exp(mean negative log-likelihood of the actual next token); lower is better. Reported for FMT and float32, with the % change |
+| top-1 agreement | % of positions where FMT and float32 predict the same most-likely token |
+| mean KL(f32 ‖ FMT) | how far FMT's whole predicted distribution moves from float32's, in nats; the most sensitive of the four (llama.cpp uses it for the same purpose) |
+| logit \|diff\| | mean and max absolute difference of raw logits, over all positions and the whole vocabulary |
+
+A run takes ~25 s without `--compare` and ~45 s with it (two models, 6
+windows each, plus scoring 3,307 × 50,257 logits).
 
 ## Design
 
@@ -216,21 +245,25 @@ position embedding `wpe` stay float32 in one small buffer.
 Trait + `DenseMatrix[float32]` + generic kernels + `Model[W]`. Acceptance:
 `tests/same_as_baseline.sh` all `SAME`, and no speed loss. Both met.
 
-### M2. Accuracy harness ⏭
+### M2. Accuracy harness ✅
 
 Lossy formats need a number to judge them by, before they exist, so a
 quantization bug can be told apart from quantization error.
 
-- `--ppl FILE`: perplexity over a text file. Needs logits at *every*
-  position, not just the last: add a forward mode that runs `lm_head` on all
-  rows, and process the text in windows of up to 1024 tokens (e.g. stride
-  512, scoring only the second half of each window after the first).
-- `--compare FMT`: run the same text through float32 and FMT and report the
-  top-1 agreement rate and the max / mean absolute logit difference.
-- Choose and commit a standard evaluation text (a few thousand tokens of
-  public-domain prose, e.g. from Project Gutenberg) under `tests/data/`.
-- Acceptance: float32 perplexity matches the NumPy reference (add a `ppl`
-  mode to `tests/reference.py`) to ~4 significant digits.
+- `--ppl FILE` and `--compare`, described under
+  [Accuracy harness](#accuracy-harness).
+- `Model.forward_all` computes logits at every position (`lm_head_rows` in
+  kernels.mojo); `Model.blocks` is the shared transformer part, so the
+  generation path is unchanged (still bit-identical).
+- Evaluation text committed as `tests/data/alice_ch1.txt`.
+- `tests/reference.py ppl` computes the same windows in NumPy.
+- Acceptance (~4 significant digits vs NumPy): met with 6. Mojo 25.284337,
+  NumPy 25.284352. float32 compared with itself gives 100% agreement and
+  exactly zero KL and logit difference.
+
+Possible later improvement: cache float32's logits (or per-position
+statistics) so `--compare` doesn't recompute the baseline for every format
+in a sweep.
 
 ### M3. 16-bit, then int4 / int8 weights (float32 compute)
 
@@ -360,18 +393,37 @@ Things that differ from older Mojo, all hit during this project:
 On the i7-1160G7, AC power, `MODULAR_THREAD_BUSY_WAIT_US=0`. Prefill: 476-token
 prompt. Decode: 200 tokens after a short prompt / after the 476-token prompt.
 
-| Format | Weights | Prefill tok/s | Decode tok/s (short / long ctx) | Perplexity | Top-1 vs f32 |
-|---|---|---|---|---|---|
-| f32 (baseline `gpt2.mojo`) | 474 MB | ~620 | ~62 / ~57 | M2 | 100% |
-| f32 (`gpt2t`) | 474 MB | same | same | M2 | 100% (bit-identical) |
-| f16 | | | | | |
-| bf16 | | | | | |
-| int8, per-channel | | | | | |
-| int4, per-channel | | | | | |
-| int4, group 128 | | | | | |
-| int4, group 64 | | | | | |
-| int4, group 32 | | | | | |
-| W4A16 (best int4 config) | | | | | |
+Perplexity, top-1 agreement, and KL are on `tests/data/alice_ch1.txt` (see
+[Accuracy harness](#accuracy-harness)). Speed ranges are from two interleaved
+rounds; the machine's speed drifts by ±15% between runs (thermal), so compare
+formats measured in the same session.
+
+Notes on f16 / bf16:
+- bf16's *lower* perplexity is luck, not better accuracy: its KL is ~430×
+  f16's and it changes the top prediction at ~5% of positions. f16 is
+  essentially lossless. This is why the harness reports KL, not just
+  perplexity.
+- Decode is ~1.3–1.6× faster than f32, less than the ~1.85× the streaming
+  probe predicted: per-token costs that don't shrink with the weights (thread
+  wake-ups for ~60 parallel regions, attention, the KV cache) are a larger
+  share of each step.
+- f16 is slower than bf16 in both prefill and decode: VCVTPH2PS costs more
+  than bf16's shift. Load time is higher for 16-bit formats because of the
+  conversion (bf16 ~1.2 s: its rounding is done in software).
+
+| Format | Weights | Prefill tok/s | Decode tok/s (short / long ctx) | Perplexity | Top-1 vs f32 | Mean KL vs f32 |
+|---|---|---|---|---|---|---|
+| f32 (baseline `gpt2.mojo`) | 474 MB | ~620 | ~62 / ~57 | 25.284 | 100% | 0 |
+| f32 (`gpt2t`, 2026-09-27 evening run) | 474 MB | 546–631 | 48–64 / 42–45 | 25.284 | 100% | 0 |
+| f32 (`gpt2t`) | 474 MB | same | same | 25.284 | 100% (bit-identical) | 0 |
+| f16 | 239 MB | 504–562 | 64–77 / 59–65 | 25.302 (+0.07%) | 99.67% | 1.7e-5 |
+| bf16 | 239 MB | 603–613 | 78–82 / 67–69 | 25.073 (−0.84%) | 95.13% | 7.4e-3 |
+| int8, per-channel | | | | | | |
+| int4, per-channel | | | | | | |
+| int4, group 128 | | | | | | |
+| int4, group 64 | | | | | | |
+| int4, group 32 | | | | | | |
+| W4A16 (best int4 config) | | | | | | |
 
 ## Open questions
 
