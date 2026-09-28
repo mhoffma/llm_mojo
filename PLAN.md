@@ -51,7 +51,7 @@ accuracy each format costs for that speed**.
 | M2. Accuracy harness (perplexity, logit comparison) | ✅ done |
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
-| M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) | 🔄 steps 1-3 done (formats, `--kv`, accuracy: the cache is not the error source); step 4 (integer attention) next |
+| M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) | 🔄 steps 1-3 and 5 done: int8 cache (now the default for quantized models) +10-16% long-context decode, +11-23% prompt, ~0.001 KL; step 4 (faster attention arithmetic) optional |
 | M6. Tuning and final results table | ☐ |
 | M7. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
@@ -112,7 +112,7 @@ Options (both programs; `--dtype` only in `gpt2t`):
 |---|---|---|
 | `--dtype FMT` | weight format: `f32`, `f16`, `bf16`, `int8-ch`, `int4-ch`, `int4-g128`, `int4-g64`, `int4-g32`, each int format also with `-sym` | `f32` |
 | `--head FMT` | with an int `--dtype`: format of wte (embedding + output head), `int8` or `same` | `int8` |
-| `--kv FMT` | KV cache format: `auto` (f32/f16/bf16 weights keep their type, quantized weights get `int16`), `f32`, `f16`, `bf16`, `int16`, `int8` | `auto` |
+| `--kv FMT` | KV cache format: `auto` (f32/f16/bf16 weights keep their type, quantized weights get `int8`), `f32`, `f16`, `bf16`, `int16`, `int8` | `auto` |
 | `-m DIR` | directory with the Hugging Face files | `gpt2` |
 | `-n N` | tokens to generate | 64 |
 | `-t TEMP` | sampling temperature; `0` = greedy | 0.8 |
@@ -485,7 +485,7 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.f
   |---|---|
   | `f32` | `f32` |
   | `f16` / `bf16` | `f16` / `bf16` |
-  | int formats (float compute or `-a16`), `--gguf` | `int16` |
+  | int formats (float compute or `-a16`), `--gguf` | `int8` (int16 until step 5 measured the speedup) |
 
 - For `-a16` models with an int16 cache, attention can use integer
   arithmetic too: the query quantized to int16 once per step, `q · k` over 64
@@ -532,7 +532,8 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.f
      folds the value scale into the softmax weight.
    - `--kv auto|f32|f16|bf16|int16|int8`; `auto` = `default_kv`: f32, f16,
      bf16 weights keep their own type, quantized weights (ours and GGUF) get
-     int16. The format shows in the model name (`...+kv-int16`). **This
+     int16 (int8 since step 5). The format shows in the model name
+     (`...+kv-int8`). **This
      changes the default for int and GGUF formats** (before: float32 cache);
      `--kv f32` reproduces the earlier behavior and results.
    - `eval_loop` now takes any `LanguageModel` (a trait with `forward_all`)
@@ -585,8 +586,8 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.f
      from. (int4-g32's lower perplexity with an int8 cache is noise at this
      scale, not an improvement: its KL is slightly higher.) The per-head
      scales are enough; GPT-2's outlier channels don't break int8 keys.
-     int16 stays the default for quantized weights; if step 5 shows a
-     worthwhile speedup, int8 is a reasonable default too.
+     int16 stayed the default for quantized weights until step 5 showed a
+     worthwhile speedup; int8 is the default now.
 4. Integer attention for `-a16` models with an int16 cache, with a unit test
    against exact math like `tests/a16_kernels.mojo`. (Not VPDPWSSD with
    full-range int16 queries: see the correction above. Attention's
@@ -611,8 +612,29 @@ struct Model[W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.f
   813-911 tok/s, 3 interleaved rounds on a busy machine); decode within
   noise. As estimated: at position 476 a decode step computes ~68K
   exponentials, ~0.4 ms of ~9 ms before.
-5. Benchmark "decode long" with `tests/bench.sh`; update Results and the
+5. ✅ Benchmark "decode long" with `tests/bench.sh`; update Results and the
    README.
+   - Done (2026-09-28). `tests/bench.sh` now takes quoted option strings
+     (`"--dtype int4-g32-a16 --kv int8"`) and `LONG_REPEAT=53` for a
+     ~900-token long prompt. 3 interleaved rounds, AC, load ~1-2:
+
+     | int4-g32-a16 + KV | prompt, 476 | decode after 476 | prompt, ~900 | decode after ~900 |
+     |---|---|---|---|---|
+     | f32 | 879 | 116 | 690 | 100 |
+     | int16 (the default at the time) | 938 (+7%) | 121 (+4%) | 783 (+13%) | 106 (+6%) |
+     | int8 | 975 (+11%) | 128 (+10%) | 847 (+23%) | 116 (+16%) |
+
+     Decode after a 1-token prompt: 145-152 for all three (the cache is
+     tiny there).
+   - Conclusions: the smaller cache pays for itself as the context grows,
+     and int8's accuracy cost is negligible (~0.001 KL on top of the
+     weights' 0.15, step 3), so int8 is the better setting for quantized
+     models. **`default_kv` now returns int8 for quantized weights** (f32,
+     f16, bf16 weights keep their own type; `--kv int16` still available).
+     Even with int8, decode after ~900 tokens (116) trails decode
+     after 1 token (~147): ~1.8 ms per token is attention arithmetic (the
+     q · k scores and value sums, one call per position and head), which
+     is what step 4 would speed up.
 
 Expectation: int16 essentially lossless, like int16 activations; int8 close,
 unless GPT-2's outlier channels make per-head key scales too coarse.

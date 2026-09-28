@@ -168,7 +168,7 @@ Timing and model size are printed to stderr after the generated text.
 |---|---|---|
 | `--dtype FMT` | weight format of the layer matrices (see below) | `f32` |
 | `--head FMT` | with an int `--dtype`: format of `wte` (embedding + output head), `int8` or `same` | `int8` |
-| `--kv FMT` | KV cache format: `auto`, `f32`, `f16`, `bf16`, `int16`, `int8` (see [KV cache](#the-kv-cache)) | `auto` |
+| `--kv FMT` | KV cache format: `auto` (f32/f16/bf16 weights keep their type, quantized weights get int8), `f32`, `f16`, `bf16`, `int16`, `int8` (see [KV cache](#the-kv-cache)) | `auto` |
 | `--gguf FILE` | use a llama.cpp GGUF file of GPT-2 124M, as stored; overrides `--dtype` | |
 | `-m DIR` | directory with `model.safetensors`, `vocab.json`, `merges.txt` | `gpt2` |
 | `-n N` | tokens to generate | 64 |
@@ -222,7 +222,7 @@ Like the weights, the cache format is a trait, `KVCache` in `kvcache.mojo`. The 
 | `f16`, `bf16` | 16-bit floats, widened when read | 36 KB |
 | `int16`, `int8` | symmetric integers, one float32 scale per (layer, position, head) for keys and one for values | ~37 KB, ~19 KB |
 
-- **The default, `auto`, matches the model's precision.** f32, f16 and bf16 weights keep their own type, and quantized weights (ours and GGUF) get int16.
+- **The default, `auto`, matches the model's precision.** f32, f16 and bf16 weights keep their own type, and quantized weights (ours and GGUF) get int8, chosen from the measurements below. `--kv` overrides it.
 - **For the integer caches:**
   - `store` quantizes each head's 64 values when a token is added.
   - `score` applies the key's scale once per dot product.
@@ -238,7 +238,17 @@ Like the weights, the cache format is a trait, `KVCache` in `kvcache.mojo`. The 
 
 These results are verified against NumPy (`tests/reference.py --kv`).
 
-Note: the int and GGUF results in the tables above were measured with a float32 cache, before the int16 default existed. `--kv f32` reproduces them.
+**Speed** (int4-g32-a16 weights, tok/s; 3 interleaved rounds of `tests/bench.sh`, with `LONG_REPEAT=53` for the ~900-token prompt):
+
+| KV cache | Prompt, 476 tokens | Decode after 476 | Prompt, ~900 tokens | Decode after ~900 |
+|---|---|---|---|---|
+| f32 | 879 | 116 | 690 | 100 |
+| int16 | 938 | 121 | 783 | 106 |
+| int8 | 975 | 128 | 847 | 116 |
+
+The smaller the cache, the less memory attention reads per token, and the gain grows with the context: int8 is 16% faster than f32 for decode after ~900 tokens, and 23% faster for the prompt.
+
+Note: the int and GGUF results in the tables above were measured with a float32 cache, before the int8 default existed. `--kv f32` reproduces them.
 
 ### The `WeightMatrix` trait
 

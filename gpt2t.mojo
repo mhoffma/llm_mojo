@@ -24,7 +24,7 @@ Usage:
     --head FMT   with an int --dtype: the tied embedding/output head's format,
                  int8 (default; int8, per vocabulary row) or same (as --dtype)
     --kv FMT     KV cache format: auto (default: f32/f16/bf16 for those
-                 weights, int16 for quantized ones), f32, f16, bf16, int16,
+                 weights, int8 for quantized ones), f32, f16, bf16, int16,
                  int8
     --gguf FILE  use the weights in a llama.cpp GGUF file of GPT-2 124M
                  (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, F32 tensors), as
@@ -889,11 +889,11 @@ comptime HEAD8_A16 = QuantMatrix[8, 0, False, True]
 
 def default_kv(weights: String) -> String:
     """The KV cache format that matches a weight format's precision: float
-    formats keep their own type; quantized formats (ours and GGUF) use int16.
-    """
+    formats keep their own type; quantized formats (ours and GGUF) use int8,
+    which costs ~0.001 KL and speeds up long contexts (PLAN.md, M5)."""
     if weights == "f32" or weights == "f16" or weights == "bf16":
         return weights
-    return "int16"
+    return "int8"
 
 
 def run[W: WeightMatrix, E: WeightMatrix = W](args: Args) raises:
