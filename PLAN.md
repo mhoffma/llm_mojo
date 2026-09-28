@@ -287,9 +287,15 @@ in a sweep.
 **Status and findings so far:**
 
 - f16 / bf16: done (see [Results](#results)).
-- Our own int8/int4 (`QuantMatrix`, `--dtype int...`): implemented and
-  verified against NumPy (`tests/reference.py --quant`), but accuracy is poor:
-  int8 per-channel +4% perplexity, int4 group 32 perplexity 259. The cause is
+- Our own int8/int4 (`QuantMatrix`, `--dtype int...`): standard affine
+  quantization, `w = scale * (u - zero_point)`, with a float16 `scale` and
+  an **integer** `zero_point` (uint8, in the codes' range) per group, so 0 is
+  exactly representable. (A first version stored a float16 offset, `w =
+  scale * u + min`, like llama.cpp's Q4_1; replaced 2026-09-28 because the
+  integer form is the standard definition and keeps the M4 kernel's inner
+  sums in integers.) Verified against NumPy (`tests/reference.py --quant`)
+  to 5-6 digits. Accuracy is still poor: int8 per-channel +3.3% perplexity,
+  int4 group 32 perplexity 353 (symmetric: 749). The cause is
   the output head: we quantize the tied `wte` together with everything else,
   while llama.cpp keeps GPT-2's output head at 6-bit (Q6_K). GGUF Q4_0, whose
   layer matrices use nearly our `int4-g32-sym` scheme, reaches 27.2 with its
@@ -341,6 +347,10 @@ Expectation to test: per-channel is fine for int8, but at int4 groups of
 32–128 are usually needed for a model this small.
 
 ### M4. int16 activations + integer kernel (W4A16)
+
+Note: `QuantMatrix` already uses an integer zero point, so per group
+`sum(x * w) = scale * (sum(x_q * u) - zero_point * sum(x_q))`, with both inner
+sums in int32. With symmetric formats `zero_point` is the constant 8 (int4).
 
 - Quantize only the matmul *inputs* (LayerNorm outputs, attention output,
   GELU output) to int16, with a scale per token row computed at runtime from
@@ -473,11 +483,12 @@ Notes on f16 / bf16:
 | f32 (`gpt2t`) | 474 MB | same | same | 25.284 | 100% (bit-identical) | 0 |
 | f16 | 239 MB | 504–562 | 64–77 / 59–65 | 25.302 (+0.07%) | 99.67% | 1.7e-5 |
 | bf16 | 239 MB | 603–613 | 78–82 / 67–69 | 25.073 (−0.84%) | 95.13% | 7.4e-3 |
-| int8, per-channel (ours, head int8 too) | 121 MB | | | 26.284 (+3.95%) | 85.0% | 3.7e-2 |
-| int4, per-channel (ours, head int4) | 62 MB | | | | | |
+| int8, per-channel (ours, head int8 too) | 121 MB | | | 26.116 (+3.29%) | | |
+| int4, per-channel (ours, head int4) | | | | | | |
 | int4, group 128 (ours, head int4) | | | | | | |
 | int4, group 64 (ours, head int4) | | | | | | |
-| int4, group 32 (ours, head int4) | 77 MB | | | 258.7 (+923%) | 25.5% | 2.4 |
+| int4, group 32 (ours, head int4) | | | | 352.6 | | |
+| int4, group 32, symmetric (ours, head int4) | | | | 748.7 | | |
 | GGUF Q8_0 (head Q6_K) | 167 MB | 574 | 63 / 56 | 25.416 (+0.52%) | 91.1% | 1.2e-2 |
 | GGUF Q4_0 (head Q6_K) | 99 MB | 710 | 80 / 79 | 27.178 (+7.49%) | 74.6% | 1.7e-1 |
 | GGUF Q4_K_M (Q4_K/Q5_K/Q6_K, head Q6_K) | 105 MB | 690 | 107 / 90 | 25.460 (+0.70%) | 80.2% | 9.8e-2 |

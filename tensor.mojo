@@ -143,22 +143,30 @@ struct DenseMatrix[dtype: DType](WeightMatrix):
 
 
 struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
-    """Affine-quantized weights: BITS-bit codes with a scale and offset per
-    group of GROUP weights along the reduction axis.
+    """Affine-quantized weights: BITS-bit codes with a scale and an integer
+    zero point per group of GROUP weights along the reduction axis.
 
     Each weight is stored as an unsigned code u in [0, 2^BITS - 1] and read
     back as
 
-        w = scale * u + min
+        w = scale * (u - zero_point)
 
-    with one (scale, min) pair per group, stored as float16. GROUP = 0 means
-    one group spans the whole reduction axis ("per-channel": one pair per
-    output column of a layer matrix, per vocabulary row of wte).
+    the standard affine form (as in PyTorch, ONNX and TFLite). Per group,
+    `scale` is a float16 and `zero_point` an unsigned integer code in the same
+    range as u, so w = 0 is represented exactly, by u = zero_point. GROUP = 0
+    means one group spans the whole reduction axis ("per-channel": one pair
+    per output column of a layer matrix, per vocabulary row of wte).
 
-    - Asymmetric: min and scale fit the group's [min, max] exactly.
-    - Symmetric: centered on zero, scale = max|w| / (2^(BITS-1) - 1) and
-      min = -2^(BITS-1) * scale, so u - 2^(BITS-1) is a signed code. This is
-      the form the integer kernel (M4) wants.
+    - Asymmetric: the group's range, widened to include 0, is mapped onto
+      [0, 2^BITS - 1]: scale = (max - min) / (2^BITS - 1) and
+      zero_point = round(-min / scale).
+    - Symmetric: zero_point = 2^(BITS-1) (8 for int4, 128 for int8) and
+      scale = max|w| / (2^(BITS-1) - 1), so u - zero_point is a signed code
+      centered on zero.
+
+    In a dot product the zero point factors out of each group:
+    sum(x * w) = scale * (sum(x * u) - zero_point * sum(x)), which keeps the
+    inner sum in integers for the integer kernel (M4).
 
     Rounding is plain round-to-nearest. int4 packs two codes per byte along
     each row: byte k holds column 2k in its low 4 bits, 2k+1 in its high 4.
@@ -166,11 +174,11 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
 
     comptime OUT_MAJOR = False
     comptime LEVELS = (1 << Self.BITS) - 1  # largest code
-    comptime HALF = 1 << (Self.BITS - 1)  # the code for zero when symmetric
+    comptime HALF = 1 << (Self.BITS - 1)  # the zero point when symmetric
 
-    var data: Pointer[UInt8, MutUntrackedOrigin]
-    var scale: Pointer[Float16, MutUntrackedOrigin]
-    var minv: Pointer[Float16, MutUntrackedOrigin]
+    var data: Pointer[UInt8, MutUntrackedOrigin]  # the codes u
+    var scale: Pointer[Float16, MutUntrackedOrigin]  # one per group
+    var zero_point: Pointer[UInt8, MutUntrackedOrigin]  # one per group
     var rows: Int
     var cols: Int
     var group: Int  # GROUP, or the reduction axis length when GROUP == 0
@@ -180,7 +188,7 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
         out self,
         data: Pointer[UInt8, MutUntrackedOrigin],
         scale: Pointer[Float16, MutUntrackedOrigin],
-        minv: Pointer[Float16, MutUntrackedOrigin],
+        zero_point: Pointer[UInt8, MutUntrackedOrigin],
         rows: Int,
         cols: Int,
         group: Int,
@@ -188,7 +196,7 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
     ):
         self.data = data
         self.scale = scale
-        self.minv = minv
+        self.zero_point = zero_point
         self.rows = rows
         self.cols = cols
         self.group = group
@@ -210,8 +218,8 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
         var ngroups = rows * cols // group
         var data = unsafe_alloc[UInt8](rows * cols * Self.BITS // 8)
         var scale = unsafe_alloc[Float16](ngroups)
-        var minv = unsafe_alloc[Float16](ngroups)
-        var m = Self(data, scale, minv, rows, cols, group, reduce_rows)
+        var zero_point = unsafe_alloc[UInt8](ngroups)
+        var m = Self(data, scale, zero_point, rows, cols, group, reduce_rows)
 
         # Visit each group as a list of flat indices: down a column when
         # reducing rows, along a row otherwise.
@@ -229,31 +237,31 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
                 for c in range(c0, c0 + group):
                     idx.append(r * cols + c)
 
-            var lo = src[unsafe_offset=idx[0]]
-            var hi = lo
+            var lo = Float32(0)  # the range always includes 0
+            var hi = Float32(0)
             for i in idx:
                 lo = min(lo, src[unsafe_offset=i])
                 hi = max(hi, src[unsafe_offset=i])
             var s: Float32
-            var mn: Float32
             comptime if Self.SYMMETRIC:
-                s = max(abs(lo), abs(hi)) / Float32(Self.HALF - 1)
-                mn = -Float32(Self.HALF) * s
+                s = max(-lo, hi) / Float32(Self.HALF - 1)
             else:
                 s = (hi - lo) / Float32(Self.LEVELS)
-                mn = lo
-            if s == 0:  # constant group: any scale reproduces it exactly
+            if s == 0:  # an all-zero group: any scale reproduces it exactly
                 s = 1
-            # Quantize against the float16-rounded values actually stored.
+            # Quantize against the float16-rounded scale actually stored.
             var s16 = s.cast[DType.float16]()
-            var m16 = mn.cast[DType.float16]()
-            scale[unsafe_offset=gi] = s16
-            minv[unsafe_offset=gi] = m16
             var sf = s16.cast[DType.float32]()
-            var mf = m16.cast[DType.float32]()
+            var zp: Int
+            comptime if Self.SYMMETRIC:
+                zp = Self.HALF
+            else:
+                zp = clamp_code(Int(round(-lo / sf)), Self.LEVELS)
+            scale[unsafe_offset=gi] = s16
+            zero_point[unsafe_offset=gi] = UInt8(zp)
             for i in idx:
-                var u = round((src[unsafe_offset=i] - mf) / sf)
-                m.set_code(i, Int(max(Float32(0), min(Float32(Self.LEVELS), u))))
+                var u = Int(round(src[unsafe_offset=i] / sf)) + zp
+                m.set_code(i, clamp_code(u, Self.LEVELS))
         return m
 
     def set_code(self, i: Int, u: Int):
@@ -282,19 +290,23 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
     def load[width: Int](self, row: Int, col: Int) -> SIMD[DType.float32, width]:
         var u = self.codes[width](row, col)
         if self.reduce_rows:
-            # Groups run down the rows: each column has its own scale, so
-            # load `width` of them.
+            # Groups run down the rows: each column has its own scale and
+            # zero point, so load `width` of each.
             var g = (row // self.group) * self.cols + col
             var s = self.scale.unsafe_load[width=width](g).cast[DType.float32]()
-            var mn = self.minv.unsafe_load[width=width](g).cast[DType.float32]()
-            return u.fma(s, mn)
+            var zp = self.zero_point.unsafe_load[width=width](g).cast[
+                DType.float32
+            ]()
+            return (u - zp) * s
         else:
-            # Groups run along the row: `width` columns share one scale
-            # (width divides the group size).
+            # Groups run along the row: `width` columns share one scale and
+            # zero point (width divides the group size).
             var g = (row * self.cols + col) // self.group
             var s = self.scale[unsafe_offset=g].cast[DType.float32]()
-            var mn = self.minv[unsafe_offset=g].cast[DType.float32]()
-            return u.fma(SIMD[DType.float32, width](s), SIMD[DType.float32, width](mn))
+            var zp = self.zero_point[unsafe_offset=g].cast[DType.float32]()
+            return (u - SIMD[DType.float32, width](zp)) * SIMD[
+                DType.float32, width
+            ](s)
 
     def dequant_row(self, row: Int, dst: FPtr):
         for i in range(0, self.cols, NW):
@@ -307,10 +319,17 @@ struct QuantMatrix[BITS: Int, GROUP: Int, SYMMETRIC: Bool](WeightMatrix):
         return d.reduce_add()
 
     def nbytes(self) -> Int:
+        """Codes, plus a float16 scale and a one-byte zero point per group."""
         var ngroups = self.rows * self.cols // self.group
-        return self.rows * self.cols * Self.BITS // 8 + ngroups * 4
+        return self.rows * self.cols * Self.BITS // 8 + ngroups * 3
 
     def free(self):
         self.data.unsafe_free()
         self.scale.unsafe_free()
-        self.minv.unsafe_free()
+        self.zero_point.unsafe_free()
+
+
+@always_inline
+def clamp_code(u: Int, levels: Int) -> Int:
+    """Clamps a code to [0, levels]."""
+    return max(0, min(levels, u))

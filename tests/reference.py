@@ -15,8 +15,8 @@ Usage (from ~/fun):
 Add --quant BITS,GROUP,SYM (e.g. --quant 4,32,0) to any mode to fake-quantize
 the same matrices gpt2t quantizes (the four per-layer matrices and wte) with
 the same scheme as tensor.mojo's QuantMatrix: round-to-nearest, float16 scale
-and min per group along the reduction axis, GROUP 0 = per-channel, SYM 1 =
-symmetric. Use it to check `gpt2t_bin --dtype int...` independently.
+and integer zero point per group along the reduction axis, GROUP 0 =
+per-channel, SYM 1 = symmetric. Use it to check `gpt2t_bin --dtype int...` independently.
 
 Add --gguf FILE to any mode to take the weights from a llama.cpp GGUF file
 instead (dequantized to float32 with the `gguf` package, so add
@@ -79,22 +79,28 @@ def t_gguf(name):
 
 
 def fake_quant(w, bits, group, sym, reduce_rows):
-    """Quantizes and dequantizes w like tensor.mojo's QuantMatrix."""
+    """Quantizes and dequantizes w like tensor.mojo's QuantMatrix:
+    w = scale * (u - zero_point), float16 scale and integer zero point per
+    group along the reduction axis."""
     W = w if reduce_rows else w.T  # put the reduction axis first
     rows, cols = W.shape
     g = rows if group == 0 else group
     Wg = W.reshape(rows // g, g, cols)
+    levels = 2**bits - 1
+    lo = np.minimum(Wg.min(axis=1), 0)  # the range always includes 0
+    hi = np.maximum(Wg.max(axis=1), 0)
     if sym:
-        s = np.abs(Wg).max(axis=1) / (2 ** (bits - 1) - 1)
-        mn = -(2 ** (bits - 1)) * s
+        s = np.maximum(-lo, hi) / (2 ** (bits - 1) - 1)
     else:
-        lo, hi = Wg.min(axis=1), Wg.max(axis=1)
-        s = (hi - lo) / (2**bits - 1)
-        mn = lo
-    s = np.where(s == 0, 1, s).astype(np.float16).astype(np.float32)[:, None, :]
-    mn = mn.astype(np.float16).astype(np.float32)[:, None, :]
-    u = np.clip(np.round((Wg - mn) / s), 0, 2**bits - 1)
-    out = (u * s + mn).reshape(rows, cols).astype(np.float32)
+        s = (hi - lo) / levels
+    s = np.where(s == 0, 1, s).astype(np.float16).astype(np.float32)
+    if sym:
+        zp = np.full_like(s, 2 ** (bits - 1))
+    else:
+        zp = np.clip(np.round(-lo / s), 0, levels)
+    s, zp = s[:, None, :], zp[:, None, :]
+    u = np.clip(np.round(Wg / s) + zp, 0, levels)
+    out = ((u - zp) * s).reshape(rows, cols).astype(np.float32)
     return out if reduce_rows else out.T
 
 
