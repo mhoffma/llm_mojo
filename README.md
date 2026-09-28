@@ -193,6 +193,8 @@ Timing and model size are printed to stderr after the generated text.
 | `--compare` | with `--ppl`: also run float32 and report agreement, KL, logit differences | off |
 | `--profile` | print time per token by operation (each matmul, attention, KV store, output head, …), for decode and prompt tokens | off |
 | `--threads N` | threads that decode each token together (see [Decode with a thread team](#decode-with-a-thread-team)) | one per core (half the runtime's threads) |
+| `--save FILE` | after loading (and converting) the weights, write them to FILE in their format; then run as usual (`-n 0` to only save) | off |
+| `--weights FILE` | load weights saved with `--save`; the file sets the formats (`--dtype` and `--head` are ignored) | off |
 
 **`--dtype` formats:**
 
@@ -489,6 +491,7 @@ Current results:
 | `gguf.mojo` | GGUF reader, `GGUFMatrix`, SIMD dequantizers for six block formats |
 | `kernels.mojo` | matmul, GEMV, `matmul_rows`, `matmul_rows_a16`, register tiles, LayerNorm, attention, output head, and the one-token team kernels `linear_team` / `head_team` |
 | `team.mojo` | `Team`: a spin-then-yield barrier for the threads that decode a token together |
+| `serialize.mojo` | `ByteWriter` / `ByteReader`, for saved model files (`--save`, `--weights`) |
 | `kvcache.mojo` | The `KVCache` / `FloatKV` traits, the float attention, `DenseKV` and `QuantKV` |
 | `int_attention.mojo` | `IntAttnKV`: int8 cache in VNNI layouts, integer attention |
 | `intmath.mojo` | Integer `masked_exp` / `masked_softmax` in fixed point |
@@ -513,7 +516,7 @@ Mojo 1.1 differs a lot from older Mojo, which most online examples use. `PLAN.md
 | M4. int16 activations with integer VNNI kernels (W4A16 / W8A16) | done |
 | M5. Pluggable KV cache formats matched to the model's precision, and integer attention | done |
 | M6. Tuning: profiling, one parallel region per decoded token, vectorized GELU, faster output heads, and a clean results re-run | done |
-| M7. Stretch: save pre-quantized weights, int8 activations (VPDPBUSD) | planned |
+| M7. Stretch: save converted weights (done: loading 0.9–2 s → 60–130 ms), int8 activations (VPDPBUSD) | in progress |
 
 Open questions (details in `PLAN.md`):
 - A second evaluation text, to firm up the accuracy numbers.

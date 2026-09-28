@@ -69,6 +69,7 @@ from kvcache import KVCache, DenseKV, QuantKV
 from int_attention import IntAttnKV
 from gguf import GGUFFile, GGUFMatrix, BPtr, GGML_F32, type_name
 from tokenizer import Tokenizer, parse_uint, read_file_bytes
+from serialize import ByteWriter, ByteReader
 
 # GPT-2 small hyperparameters.
 comptime N_LAYER = 12
@@ -608,6 +609,95 @@ def load_model[
     return model^
 
 
+# Saved models (--save / --weights, M7): the matrices already converted to
+# their formats, so loading is just reading (no quantization). Layout, in
+# serialize.mojo's encoding:
+#   SAVED_MAGIC, SAVED_VERSION, W.name(), E.name(),
+#   wte (E.save), the N_LAYER * N_MATS layer matrices (W.save, in load_model's
+#   order), SMALL_FLOATS, then the small float32 tensors as Model.small holds
+#   them (SMALL_ORDER).
+comptime SAVED_MAGIC = "llm_mojo GPT-2 124M weights"
+comptime SAVED_VERSION = 1
+
+
+def save_model[
+    W: WeightMatrix, E: WeightMatrix, KV: KVCache
+](model: Model[W, E, KV], path: String) raises:
+    """Writes the model's weights, as converted, to path."""
+    if not model.tied:
+        raise Error("--save supports models with a tied output head only")
+    var w = ByteWriter(path)
+    w.string(SAVED_MAGIC)
+    w.int(SAVED_VERSION)
+    w.string(W.name())
+    w.string(E.name())
+    model.wte.save(w)
+    for m in model.mats:
+        m.save(w)
+    w.int(SMALL_FLOATS)
+    w.buffer(model.small, SMALL_FLOATS)
+    w.close()
+    print("saved", W.name(), "+ head", E.name(), "to", path, "(", w.written // 1000000, "MB )")
+
+
+def check_magic(mut r: ByteReader, path: String) raises:
+    """Raises unless the file starts with SAVED_MAGIC and SAVED_VERSION."""
+    var magic = String(SAVED_MAGIC)
+    if r.int() != magic.byte_length() or r.chars(magic.byte_length()) != magic:
+        raise Error(path + " is not a saved llm_mojo model (see --save)")
+    var version = r.int()
+    if version != SAVED_VERSION:
+        raise Error(path + ": unsupported version " + String(version))
+
+
+def saved_formats(path: String) raises -> Tuple[String, String]:
+    """The layer and head format names of a saved model file."""
+    var r = ByteReader(path)
+    check_magic(r, path)
+    var layers = r.string()
+    var head = r.string()
+    r.close()
+    return (layers, head)
+
+
+def load_saved[
+    W: WeightMatrix, E: WeightMatrix = W, KV: KVCache = DenseKV[DType.float32]
+](path: String) raises -> Model[W, E, KV]:
+    """Loads a model written by save_model; its formats must be W and E."""
+    var r = ByteReader(path)
+    check_magic(r, path)
+    var layers = r.string()
+    var head = r.string()
+    if layers != W.name() or head != E.name():
+        raise Error(
+            path + " holds " + layers + " + head " + head + ", not "
+            + W.name() + " + head " + E.name()
+        )
+    var wte = E.restore(r)
+    var mats = List[W](capacity=N_LAYER * N_MATS)
+    for _ in range(N_LAYER * N_MATS):
+        mats.append(W.restore(r))
+    if r.int() != SMALL_FLOATS:
+        raise Error(path + ": unexpected size of the float32 tensors")
+    var small = r.buffer[DType.float32](SMALL_FLOATS)
+    r.close()
+    # Pointers into small in Model's order; the constructor copies them.
+    var small_src = List[FPtr]()
+    var off = 0
+    for _ in range(N_LAYER):
+        comptime for s in range(N_VECS):
+            comptime n = VEC_LENS[s]
+            small_src.append(small.unsafe_offset(off))
+            off += n
+    small_src.append(small.unsafe_offset(off))  # wpe
+    off += MAX_T * C
+    small_src.append(small.unsafe_offset(off))  # ln_f weight
+    small_src.append(small.unsafe_offset(off + C))  # ln_f bias
+    var model = Model[W, E, KV](wte, wte, True, mats^, small_src, unsafe_alloc[UInt8](1))
+    small.unsafe_free()
+    return model^
+
+
 # GGUF names for MAT_NAMES and VEC_NAMES (llama.cpp's GPT-2 conversion).
 comptime GGUF_MAT_NAMES = [
     "attn_qkv.weight",
@@ -766,6 +856,8 @@ struct Args(Movable):
     var attention: String  # "float", or "int" (integer attention, int8 cache)
     var profile: Bool  # print time per operation at the end
     var threads: Int  # decode team size; 0 = the runtime's parallelism level
+    var save: String  # write the converted weights here (M7)
+    var weights: String  # load weights saved with --save instead
 
     def __init__(out self) raises:
         self.dtype = "f32"
@@ -784,6 +876,8 @@ struct Args(Movable):
         self.attention = "float"
         self.profile = False
         self.threads = 0
+        self.save = ""
+        self.weights = ""
         var args = argv()
         var a = 1
         while a < len(args):
@@ -810,6 +904,10 @@ struct Args(Movable):
                     self.attention = val
                 elif arg == "--threads":
                     self.threads = atol(val)
+                elif arg == "--save":
+                    self.save = val
+                elif arg == "--weights":
+                    self.weights = val
                 elif arg == "-m":
                     self.dir = val
                 elif arg == "-n":
@@ -1106,13 +1204,19 @@ def evaluate[
 def load[
     W: WeightMatrix, E: WeightMatrix, KV: KVCache
 ](args: Args) raises -> Model[W, E, KV]:
-    """Loads the model for formats W, E and KV: from --gguf for GGUF,
-    otherwise from the Hugging Face safetensors, converted."""
+    """Loads the model for formats W, E and KV: from --gguf for GGUF, from
+    --weights for a saved model, otherwise from the Hugging Face
+    safetensors, converted. With --save, also writes the converted weights."""
     comptime if W.FROM_GGUF:
+        if args.save.byte_length() > 0:
+            raise Error("--save: GGUF files are already stored converted")
         # W and E are GGUFMatrix here; rebind_var tells the compiler so.
         return rebind_var[Model[W, E, KV]](load_gguf[KV](args.gguf))
     else:
-        return load_model[W, E, KV](args.dir + "/model.safetensors")
+        var model = load_saved[W, E, KV](args.weights) if args.weights.byte_length() > 0 else load_model[W, E, KV](args.dir + "/model.safetensors")
+        if args.save.byte_length() > 0:
+            save_model(model, args.save)
+        return model^
 
 
 def model_name[W: WeightMatrix, E: WeightMatrix, KV: KVCache]() -> String:
@@ -1190,6 +1294,11 @@ def run_quantized[W: WeightMatrix](args: Args) raises:
 
 def main() raises:
     var args = Args()
+    if args.weights.byte_length() > 0:
+        # A saved model's formats come from its file.
+        var f = saved_formats(args.weights)
+        args.dtype = f[0]
+        args.head = "same" if f[1] == f[0] else "int8"
     if args.gguf.byte_length() > 0:
         run[GGUFMatrix](args)
         return

@@ -20,6 +20,8 @@ from std.sys import simd_width_of, size_of
 from std.os import abort
 from std.math import round
 
+from serialize import ByteWriter, ByteReader
+
 comptime FPtr = Pointer[Float32, MutUntrackedOrigin]
 comptime NW = simd_width_of[DType.float32]()
 comptime F32V = SIMD[DType.float32, NW]
@@ -130,6 +132,16 @@ trait WeightMatrix(Deinitable, ImplicitlyCopyable):
         """Bytes of storage, to report the model's size."""
         ...
 
+    def save(self, mut w: ByteWriter) raises:
+        """Writes the matrix (shape and storage, as laid out in memory) for
+        restore: saved models load without converting again (M7)."""
+        raise Error("this weight format can't be saved")
+
+    @staticmethod
+    def restore(mut r: ByteReader) raises -> Self:
+        """Reads a matrix written by save."""
+        raise Error("this weight format can't be restored")
+
     def free(self):
         """Releases the storage."""
         ...
@@ -199,6 +211,17 @@ struct DenseMatrix[dtype: DType](WeightMatrix):
 
     def nbytes(self) -> Int:
         return self.rows * self.cols * size_of[Scalar[Self.dtype]]()
+
+    def save(self, mut w: ByteWriter) raises:
+        w.int(self.rows)
+        w.int(self.cols)
+        w.buffer(self.data, self.rows * self.cols)
+
+    @staticmethod
+    def restore(mut r: ByteReader) raises -> Self:
+        var rows = r.int()
+        var cols = r.int()
+        return Self(r.buffer[Self.dtype](rows * cols), rows, cols)
 
     def free(self):
         self.data.unsafe_free()
@@ -607,6 +630,30 @@ struct QuantMatrix[
         """Codes, plus a float16 scale and a one-byte zero point per group."""
         var ngroups = self.rows * self.cols // self.group
         return self.rows * self.cols * Self.BITS // 8 + ngroups * 3
+
+    def save(self, mut w: ByteWriter) raises:
+        # The codes are saved in their in-memory layout (for BLOCKED formats,
+        # already reordered for decode), so restoring is just reading.
+        var groups = self.rows * (self.cols // self.group)
+        w.int(self.rows)
+        w.int(self.cols)
+        w.int(self.group)
+        w.buffer(self.data, self.rows * self.cols * Self.BITS // 8)
+        w.buffer(self.scale, groups)
+        w.buffer(self.zero_point, groups)
+
+    @staticmethod
+    def restore(mut r: ByteReader) raises -> Self:
+        var rows = r.int()
+        var cols = r.int()
+        var group = r.int()
+        if group <= 0 or cols % group != 0:
+            raise Error("bad group size in saved matrix")
+        var groups = rows * (cols // group)
+        var data = r.buffer[DType.uint8](rows * cols * Self.BITS // 8)
+        var scale = r.buffer[DType.float16](groups)
+        var zero_point = r.buffer[DType.uint8](groups)
+        return Self(data, scale, zero_point, rows, cols, group)
 
     def free(self):
         self.data.unsafe_free()

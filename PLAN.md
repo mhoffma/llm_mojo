@@ -53,7 +53,7 @@ accuracy each format costs for that speed**.
 | M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
 | M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) + integer attention | ✅ done: int8 cache default for quantized models (+10-16% long-context decode); `--attention int` (integer attention on an int8 VNNI-layout cache) another +9-15% long-context decode at no accuracy cost |
 | M6. Tuning and final results table | ✅ profiling, vectorized KV store, one-region team decode (+~40% decode), vectorized decode GELU, faster output heads, clean results re-run done |
-| M7. Stretch: pre-quantized weight files, int8 activations | ☐ |
+| M7. Stretch: pre-quantized weight files, int8 activations | 🔄 step 1 (saved weight files) done |
 
 ## Getting started
 
@@ -116,6 +116,8 @@ Options (both programs; `--dtype` only in `gpt2t`):
 | `--attention A` | `float`, or `int`: attention in integers (needs the int8 cache) | `float` |
 | `--profile` | print time per token by operation, for decode and prompt tokens | off |
 | `--threads N` | decode team size (capped at the runtime's thread count) | half the runtime's threads (one per core) |
+| `--save FILE` | write the loaded (converted) weights to FILE, then run as usual | off |
+| `--weights FILE` | load weights saved with `--save`; the file's header sets the formats | off |
 | `-m DIR` | directory with the Hugging Face files | `gpt2` |
 | `-n N` | tokens to generate | 64 |
 | `-t TEMP` | sampling temperature; `0` = greedy | 0.8 |
@@ -165,6 +167,7 @@ users can install Modular's Mojo extension.
 | `kvcache.mojo` | The `KVCache` / `FloatKV` traits, float attention (`attend_float`), and `DenseKV[dtype]`, `QuantKV[bits]` |
 | `int_attention.mojo` | `IntAttnKV`: int8 cache in VNNI layouts with integer attention |
 | `team.mojo` | `Team`: spin-then-yield barrier for the decode thread team |
+| `serialize.mojo` | `ByteWriter` / `ByteReader`: integers, strings and raw buffers streamed to and from a file (saved models) |
 | `intmath.mojo` | Integer `masked_exp` / `masked_softmax` in fixed point |
 | `tokenizer.mojo` | GPT-2 byte-level BPE tokenizer (reads `vocab.json`, `merges.txt`) |
 | `tests/` | Correctness checks and the accuracy harness's reference (see below); `tests/data/` holds the evaluation text |
@@ -812,9 +815,47 @@ Next steps, in order:
 
 ### M7. Stretch
 
-- Save pre-quantized weights to a file so loading skips quantization.
-- int8 activations with VPDPBUSD (u8 × s8), which needs care with GPT-2's
-  outlier activation channels.
+1. ✅ **Saved weight files** (2026-09-28). `--save FILE` writes the model's
+   weights as loaded, already converted to their formats; `--weights FILE`
+   loads them without converting. Each format writes and reads itself
+   (`WeightMatrix.save` / `restore`, default: raise, so GGUF can't be
+   saved; it's stored converted already): DenseMatrix its shape and
+   elements, QuantMatrix its shape, group, codes (in memory layout, so
+   int4-g32-a16's decode reordering is saved too), float16 scales and
+   uint8 zero points. The file (`gpt2t.mojo`, `save_model` /
+   `load_saved`): magic string and version, the layer and head format
+   names, wte, the 48 layer matrices, and the small float32 tensors
+   (biases, LayerNorms, wpe) as `Model.small` holds them. `main` reads the
+   format names from the header and instantiates the matching model, so
+   `--dtype` isn't needed. `serialize.mojo` streams buffers straight
+   between memory and the file.
+
+   | format | file | load, converting | load, saved |
+   |---|---|---|---|
+   | f32 | 474 MB | 573 ms | 207 ms |
+   | f16 | 251 MB | 427 ms | 134 ms |
+   | bf16 | 251 MB | 641 ms | 122 ms |
+   | int8-ch | 128 MB | 877 ms | 71 ms |
+   | int8-ch-a16 | 128 MB | 884 ms | 76 ms |
+   | int4-g32 | 93 MB | 1262 ms | 60 ms |
+   | int4-g32-a16 | 93 MB | 2047 ms | 65 ms |
+   | int4-ch-a16 | 85 MB | 1217 ms | 69 ms |
+
+   (Load includes the tokenizer and allocating the KV cache; the file is
+   in the page cache after the first run.) Generated text is identical for
+   all of these, and int4-g32-a16's perplexity from the saved file is the
+   same to the last digit (25.5359127453538). `tests/same_as_baseline.sh`
+   still SAME. Only models with a tied output head can be saved, which is
+   every model loaded from safetensors.
+
+   Usage: `./gpt2t_bin --dtype int4-g32-a16 --save gpt2/int4-g32-a16.llmm -n 0`
+   once, then `./gpt2t_bin --weights gpt2/int4-g32-a16.llmm "prompt"`.
+2. int8 activations with VPDPBUSD (u8 × s8, 64 multiply-adds per
+   instruction instead of 32), which needs care with GPT-2's outlier
+   activation channels: one scale per row makes the small channels
+   coarse. Options: a scale per block of 32 or 256 activations (as
+   llama.cpp's Q8_K), or keeping the outlier channels in int16. Its first
+   target is the arithmetic-bound GGUF Q6_K head and GGUF layers (M6).
 
 ## Research findings
 
