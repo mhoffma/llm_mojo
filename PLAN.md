@@ -52,7 +52,7 @@ accuracy each format costs for that speed**.
 | M3. float16 / bfloat16, int8/int4 weights, GGUF weights; float32 compute | ✅ done (f16/bf16, GGUF, own int8/int4 with int8 head, fast kernels for all) |
 | M4. int16 activations + integer VNNI kernel (W4A16) | ✅ done: int4-g32-a16 is the fastest decoder (~140 tok/s) at +1.2% perplexity, prefill ~800 tok/s |
 | M5. Pluggable KV cache formats (f32 / f16 / bf16 / int16 / int8) + integer attention | ✅ done: int8 cache default for quantized models (+10-16% long-context decode); `--attention int` (integer attention on an int8 VNNI-layout cache) another +9-15% long-context decode at no accuracy cost |
-| M6. Tuning and final results table | 🔄 profiling, vectorized KV store, one-region team decode (+~40% decode) done; output head and clean results run next |
+| M6. Tuning and final results table | 🔄 profiling, vectorized KV store, one-region team decode (+~40% decode), vectorized decode GELU done; output head and clean results run next |
 | M7. Stretch: pre-quantized weight files, int8 activations | ☐ |
 
 ## Getting started
@@ -769,6 +769,12 @@ Next steps, in order:
   |---|---|---|---|
   | f16 | 100 / 90 | 74 / 65 | 138 / 116 |
   | int4-g32-a16 --attention int | 167 / 152 | 102 / 109 | 237 / 224 |
+- Decode GELU vectorized (`kernels.emit_rows`): the team kernel's
+  ACT16 and OUT_MAJOR paths compute rows one at a time but run the epilogue
+  (GELU, residual, store) 16 rows at a time through `store_out`. SIMD tanh
+  matches scalar tanh bit for bit, so output is identical for every format.
+  Decode, 128 tokens, 3 runs: int4-g32-a16 --attention int 229-244 ->
+  242-278 tok/s; f16 127-140 -> 138-144 (noisy machine).
 
 ### M7. Stretch
 
@@ -804,7 +810,8 @@ The probes in `research/` (run: `uv run mojo run research/<file>.mojo`):
   slower than SIMD float tanh (0.40 ns/element); `x·σ(1.702x)` and I-BERT's
   i-GELU miss GPT-2's tanh form by ~2e-2. Side finding for M6: decode's
   GELU (`kernels.finish`) uses scalar tanh (3.0 ns), ~0.11 ms per token;
-  vectorizing the MLP up-projection's epilogue would recover most of it.
+  vectorizing the MLP up-projection's epilogue recovers most of it (done:
+  `kernels.emit_rows`).
 
 Hardware of the development machine (i7-1160G7): 4 cores / 8 threads, one
 512-bit FMA unit per core, 5 MB L2, 12 MB L3, 16 GB RAM, measured ~44–55 GB/s

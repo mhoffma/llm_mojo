@@ -697,6 +697,30 @@ def head[W: WeightMatrix, //](logits: FPtr, h: FPtr, w: W, T: Int, V: Int, C: In
 # lm_head's chunks, one dot product per row), so results are identical.
 
 
+@always_inline
+def emit_rows[
+    RESID: Bool, GELU: Bool, F: def(Int) -> Float32
+](out_: FPtr, o0: Int, o1: Int, row: F):
+    """out[o] = epilogue(row(o)) for o in [o0, o1): the values are computed
+    one row at a time, but the epilogue (GELU, residual add, store) runs 16
+    at a time with store_out, and only leftover rows use the scalar finish.
+
+    GELU's tanh is ~7x faster on 16 lanes than one value at a time
+    (research/test_gelu.mojo), and SIMD tanh gives exactly the scalar
+    results lane by lane, so the output is unchanged bit for bit.
+    """
+    var o = o0
+    while o + 16 <= o1:
+        var v = SIMD[DType.float32, 16](0)
+        comptime for k in range(16):
+            v[k] = row(o + k)
+        store_out[RESID, GELU, 16](out_, o, v)
+        o += 16
+    while o < o1:
+        finish[RESID, GELU](out_, o, row(o))
+        o += 1
+
+
 def linear_team[
     W: WeightMatrix, //, RESID: Bool = False, GELU: Bool = False, BIAS: Bool = True
 ](
@@ -732,18 +756,24 @@ def linear_team[
         var x1 = xp if sx[unsafe_offset=1] != 0 else xq
         var s = sx[unsafe_offset=0]
         var r = split(OUT, tid, nt)
-        for o in range(r[0], r[1]):
+
+        def row_i16(o: Int) {imm} -> Float32:
             var v = w.dot_row_i16(o, x1, xs) * s
             comptime if BIAS:
                 v += b[unsafe_offset=o]
-            finish[RESID, GELU](out_, o, v)
+            return v
+
+        emit_rows[RESID, GELU](out_, r[0], r[1], row_i16)
     elif W.OUT_MAJOR:
         var r = split(OUT, tid, nt)
-        for o in range(r[0], r[1]):
+
+        def row_f32(o: Int) {imm} -> Float32:
             var v = w.dot_row(o, x)
             comptime if BIAS:
                 v += b[unsafe_offset=o]
-            finish[RESID, GELU](out_, o, v)
+            return v
+
+        emit_rows[RESID, GELU](out_, r[0], r[1], row_f32)
     else:
         # gemv: thread tid is part tid (the same bands as gemv with
         # nparts = nt), then the partial sums are added in the same order.
