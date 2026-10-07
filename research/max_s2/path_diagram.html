@@ -1,0 +1,188 @@
+<title>Model to Hexagon via MAX</title>
+<style>
+        
+          :root {
+            --bg: #f5f6f7;
+            --fg: #1b2227;
+            --muted: #5d6870;
+            --line: #8a949b;
+            --band: #eceff1;
+            --box: #ffffff;
+            --accent: #0d7a73;
+            --accent-bg: #dcf0ee;
+            --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+            --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+          }
+          @media (prefers-color-scheme: dark) {
+            :root:not([data-theme="light"]) {
+              --bg: #12171a; --fg: #e3e8ea; --muted: #97a3aa; --line: #6c7a82; --band: #1a2125;
+              --box: #1f282d; --accent: #4fc3b9; --accent-bg: #163a38; color-scheme: dark;
+            }
+          }
+          :root[data-theme="dark"] {
+            --bg: #12171a; --fg: #e3e8ea; --muted: #97a3aa; --line: #6c7a82; --band: #1a2125;
+            --box: #1f282d; --accent: #4fc3b9; --accent-bg: #163a38; color-scheme: dark;
+          }
+          .band { fill: var(--band); stroke: none; }
+          .band-label { font: 600 11px var(--font-mono); letter-spacing: .08em; fill: var(--muted); }
+          .row-label { font: 600 11px var(--font-mono); letter-spacing: .06em; }
+          .box { fill: var(--box); stroke: var(--line); stroke-width: 1.5; }
+          .box.new { fill: var(--accent-bg); stroke: var(--accent); stroke-width: 2; }
+          .box.todo { stroke-dasharray: 6 4; }
+          .t { font: 600 13px var(--font-body); fill: var(--fg); }
+          .s { font: 400 11.5px var(--font-mono); fill: var(--muted); }
+          .new-t { fill: var(--accent); }
+          .edge { fill: none; stroke: var(--line); stroke-width: 1.6; }
+          .edge.new { stroke: var(--accent); stroke-width: 2.2; }
+          .edge.todo { stroke-dasharray: 6 4; }
+          .elab { font: 400 11.5px var(--font-mono); fill: var(--muted); }
+          .tag { font: 600 11.5px var(--font-mono); fill: var(--accent); }
+          .arr { fill: var(--line); }
+          .arr-new { fill: var(--accent); }
+        
+  body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 15px;
+         line-height: 1.55; padding-inline: 16px; padding-block: 28px; }
+  main { max-width: 1040px; margin: 0 auto; }
+  h1 { font-size: 26px; line-height: 1.2; margin: 0 0 8px; font-weight: 600; text-wrap: balance; }
+  .lede { margin: 0 0 24px; color: var(--muted); max-width: 68ch; }
+  figure { margin: 0; }
+  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--box); }
+  svg { display: block; min-width: 780px; width: 100%; height: auto; color: var(--fg); }
+  figcaption { margin-top: 12px; color: var(--muted); max-width: 72ch; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 14px 0 0; padding: 0; list-style: none;
+            font-size: 13px; color: var(--muted); }
+  .legend li { display: flex; align-items: center; gap: 8px; }
+  .legend svg { min-width: 0; width: 34px; height: 16px; display: inline-block; }
+  h2 { font-size: 15px; letter-spacing: .06em; text-transform: uppercase; margin: 30px 0 8px; color: var(--muted); font-weight: 600; }
+  ul.facts { margin: 0; padding-left: 18px; max-width: 72ch; }
+  ul.facts li { margin-bottom: 6px; }
+  code { font-family: var(--font-mono); font-size: 13px; }
+</style>
+
+<main>
+  <h1>Model to Hexagon via MAX</h1>
+  <p class="lede">How a Hugging Face checkpoint reaches the Hexagon v75 cDSP when MAX builds the graph. The teal lane is the new front end; the grey lane is the existing one. They meet at the same <code>hexagon::</code> program, so everything after that point is unchanged.</p>
+
+  <figure>
+    <div class="scroll">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 540" role="img"
+           aria-label="Two front ends, MAX graph with max_lower.py and torch.export with lower.py, both produce one hexagon:: program, which hexagon_torch packs into an .hxb that is copied to the board, loaded by the device server, and run by the Mojo kernel skeleton on the cDSP.">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 1 L10 5 L0 9 z" class="arr"/></marker>
+          <marker id="an" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 1 L10 5 L0 9 z" class="arr-new"/></marker>
+        </defs>
+
+        <rect id="bg" width="1000" height="540" style="fill:var(--box)"/>
+        <!-- bands -->
+        <rect class="band" x="8" y="8" width="984" height="286" rx="6"/>
+        <text class="band-label" x="22" y="28">WORKSTATION · x86</text>
+        <rect class="band" x="8" y="318" width="984" height="206" rx="6"/>
+        <text class="band-label" x="22" y="338">BOARD vq · aarch64 + HEXAGON v75</text>
+
+        <!-- row labels -->
+        <text class="row-label new-t" x="190" y="58">NEW · MAX FRONT END</text>
+        <text class="row-label" x="190" y="186" style="fill:var(--muted)">TODAY · TORCH.EXPORT FRONT END</text>
+
+        <!-- checkpoint -->
+        <rect class="box" x="22" y="118" width="130" height="64" rx="5"/>
+        <text class="t" x="87" y="145" text-anchor="middle">HF checkpoint</text>
+        <text class="s" x="87" y="164" text-anchor="middle">safetensors</text>
+
+        <!-- MAX lane -->
+        <path class="edge new" d="M152 138 L172 138 L172 96 L190 96" marker-end="url(#an)"/>
+        <rect class="box new" x="190" y="66" width="160" height="62" rx="5"/>
+        <text class="t" x="270" y="88" text-anchor="middle">MAX graph</text>
+        <text class="s" x="270" y="104" text-anchor="middle">max.nn Llama3, MO ops</text>
+        <text class="s" x="270" y="118" text-anchor="middle">weights by HF name</text>
+
+        <path class="edge new" d="M350 97 L388 97" marker-end="url(#an)"/>
+        <text class="elab" x="369" y="88" text-anchor="middle">walk</text>
+        <rect class="box new" x="390" y="66" width="160" height="62" rx="5"/>
+        <text class="t" x="470" y="88" text-anchor="middle">max_lower.py</text>
+        <text class="s" x="470" y="104" text-anchor="middle">MO op → hexagon:: op</text>
+        <text class="s" x="470" y="118" text-anchor="middle">folds constants</text>
+
+        <!-- torch lane -->
+        <path class="edge" d="M152 162 L172 162 L172 222 L190 222" marker-end="url(#a)"/>
+        <rect class="box" x="190" y="192" width="160" height="62" rx="5"/>
+        <text class="t" x="270" y="214" text-anchor="middle">torch.export</text>
+        <text class="s" x="270" y="230" text-anchor="middle">aten graph</text>
+        <text class="s" x="270" y="244" text-anchor="middle">reference modules</text>
+
+        <path class="edge" d="M350 223 L388 223" marker-end="url(#a)"/>
+        <text class="elab" x="369" y="214" text-anchor="middle">match</text>
+        <rect class="box" x="390" y="192" width="160" height="62" rx="5"/>
+        <text class="t" x="470" y="214" text-anchor="middle">lower.py</text>
+        <text class="s" x="470" y="230" text-anchor="middle">aten patterns →</text>
+        <text class="s" x="470" y="244" text-anchor="middle">hexagon:: ops</text>
+
+        <!-- convergence -->
+        <path class="edge new" d="M550 97 L574 97 L574 150 L606 150" marker-end="url(#an)"/>
+        <path class="edge" d="M550 223 L574 223 L574 178 L606 178" marker-end="url(#a)"/>
+        <rect class="box" x="608" y="100" width="170" height="126" rx="5" style="stroke-width:2"/>
+        <text class="t" x="693" y="124" text-anchor="middle">hexagon:: program</text>
+        <text class="s" x="693" y="145" text-anchor="middle">linear · rms_norm</text>
+        <text class="s" x="693" y="160" text-anchor="middle">rope · index_copy</text>
+        <text class="s" x="693" y="175" text-anchor="middle">sdpa · swiglu · add</text>
+        <text class="s" x="693" y="196" text-anchor="middle">fp16, packed HMX</text>
+        <text class="s" x="693" y="210" text-anchor="middle">weights and caches</text>
+        <text class="tag" x="693" y="246" text-anchor="middle">run on host emulator</text>
+        <text class="elab" x="693" y="262" text-anchor="middle">12/12 tokens = fp32 ref</text>
+
+        <!-- export -->
+        <path class="edge todo" d="M778 163 L808 163" marker-end="url(#a)"/>
+        <rect class="box todo" x="810" y="100" width="172" height="126" rx="5"/>
+        <text class="t" x="896" y="124" text-anchor="middle">hexagon_torch</text>
+        <text class="s" x="896" y="145" text-anchor="middle">static shapes</text>
+        <text class="s" x="896" y="160" text-anchor="middle">memplan, 8 MB VTCM</text>
+        <text class="s" x="896" y="175" text-anchor="middle">schedule bytecode</text>
+        <text class="s" x="896" y="190" text-anchor="middle">export_blob</text>
+        <text class="t" x="896" y="212" text-anchor="middle">→ .hxb</text>
+
+        <!-- elbow to the board -->
+        <path class="edge todo" d="M896 226 L896 304 L130 304 L130 364" marker-end="url(#a)"/>
+        <text class="elab" x="513" y="298" text-anchor="middle">scp .hxb to vq</text>
+
+        <!-- board band -->
+        <rect class="box" x="22" y="366" width="216" height="92" rx="5"/>
+        <text class="t" x="130" y="392" text-anchor="middle">device server</text>
+        <text class="s" x="130" y="412" text-anchor="middle">Mojo, port 9870</text>
+        <text class="s" x="130" y="427" text-anchor="middle">rpcmem arenas, DSP lock</text>
+        <text class="s" x="130" y="442" text-anchor="middle">patches the schedule</text>
+
+        <path class="edge" d="M238 412 L296 412" marker-end="url(#a)"/>
+        <text class="elab" x="267" y="403" text-anchor="middle">FastRPC</text>
+        <rect class="box" x="298" y="366" width="250" height="92" rx="5"/>
+        <text class="t" x="423" y="392" text-anchor="middle">liblayer_skel.so</text>
+        <text class="s" x="423" y="412" text-anchor="middle">Mojo kernels → riscv32 IR</text>
+        <text class="s" x="423" y="427" text-anchor="middle">→ retarget → Hexagon clang</text>
+        <text class="s" x="423" y="442" text-anchor="middle">hwsched executor</text>
+
+        <path class="edge" d="M548 412 L606 412" marker-end="url(#a)"/>
+        <text class="elab" x="577" y="403" text-anchor="middle">runs</text>
+        <rect class="box" x="608" y="366" width="374" height="92" rx="5"/>
+        <text class="t" x="795" y="392" text-anchor="middle">cDSP v75</text>
+        <text class="s" x="795" y="412" text-anchor="middle">HMX matmul · HVX vector ops</text>
+        <text class="s" x="795" y="427" text-anchor="middle">activations in 8 MB VTCM</text>
+        <text class="s" x="795" y="442" text-anchor="middle">weights streamed from DDR by DMA</text>
+
+        <!-- note under board -->
+        <text class="elab" x="22" y="496">Mojo has no Hexagon target, so the kernels leave Mojo as RISC-V LLVM IR and are retargeted here.</text>
+        <text class="elab" x="22" y="514">The DSP side and the .hxb container are the same whichever front end produced the program.</text>
+      </svg>
+    </div>
+    <figcaption>One program, two ways to make it. MAX replaces the torch.export front end and the regex lowering in <code>lower.py</code>; the <code>hexagon::</code> ops, memory plan, container, server and DSP kernels are shared.</figcaption>
+    <ul class="legend" aria-label="Legend">
+      <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>solid: exists and has run</li>
+      <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 3"/></svg>dashed: not yet run from the MAX front end</li>
+      <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" style="fill:var(--accent-bg);stroke:var(--accent)" stroke-width="2"/></svg>new code in the MAX scoping work</li>
+    </ul>
+  </figure>
+
+  <h2>Where it stands</h2>
+  <ul class="facts">
+    <li>The MAX graph and <code>max_lower.py</code> are built. A decoder block matches <code>lower.py</code>'s op set exactly and its output bit for bit when the RoPE table is the same.</li>
+    <li>TinyLlama, all 22 layers, generated 12 greedy tokens through this path on the host emulator, identical to the fp32 PyTorch reference.</li>
+    <li>Not done: turning the program into a static-shape export, building an <code>.hxb</code>, and running it on the board.</li>
+  </ul>
+</main>

@@ -1,0 +1,45 @@
+<title>Model to Hexagon via MAX</title>
+<style>
+{{CSS}}
+  body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 15px;
+         line-height: 1.55; padding-inline: 16px; padding-block: 28px; }
+  main { max-width: 1040px; margin: 0 auto; }
+  h1 { font-size: 26px; line-height: 1.2; margin: 0 0 8px; font-weight: 600; text-wrap: balance; }
+  .lede { margin: 0 0 24px; color: var(--muted); max-width: 68ch; }
+  figure { margin: 0; }
+  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--box); }
+  svg { display: block; min-width: 780px; width: 100%; height: auto; color: var(--fg); }
+  figcaption { margin-top: 12px; color: var(--muted); max-width: 72ch; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 14px 0 0; padding: 0; list-style: none;
+            font-size: 13px; color: var(--muted); }
+  .legend li { display: flex; align-items: center; gap: 8px; }
+  .legend svg { min-width: 0; width: 34px; height: 16px; display: inline-block; }
+  h2 { font-size: 15px; letter-spacing: .06em; text-transform: uppercase; margin: 30px 0 8px; color: var(--muted); font-weight: 600; }
+  ul.facts { margin: 0; padding-left: 18px; max-width: 72ch; }
+  ul.facts li { margin-bottom: 6px; }
+  code { font-family: var(--font-mono); font-size: 13px; }
+</style>
+
+<main>
+  <h1>Model to Hexagon via MAX</h1>
+  <p class="lede">How a Hugging Face checkpoint reaches the Hexagon v75 cDSP when MAX builds the graph. The teal lane is the new front end; the grey lane is the existing one. They meet at the same <code>hexagon::</code> program, so everything after that point is unchanged.</p>
+
+  <figure>
+    <div class="scroll">
+      {{SVG}}
+    </div>
+    <figcaption>One program, two ways to make it. MAX replaces the torch.export front end and the regex lowering in <code>lower.py</code>; the <code>hexagon::</code> ops, memory plan, container, server and DSP kernels are shared.</figcaption>
+    <ul class="legend" aria-label="Legend">
+      <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>solid: exists and has run</li>
+      <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 3"/></svg>dashed: not yet run from the MAX front end</li>
+      <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" style="fill:var(--accent-bg);stroke:var(--accent)" stroke-width="2"/></svg>new code in the MAX scoping work</li>
+    </ul>
+  </figure>
+
+  <h2>Where it stands</h2>
+  <ul class="facts">
+    <li>The MAX graph and <code>max_lower.py</code> are built. A decoder block matches <code>lower.py</code>'s op set exactly and its output bit for bit when the RoPE table is the same.</li>
+    <li>TinyLlama, all 22 layers, generated 12 greedy tokens through this path on the host emulator, identical to the fp32 PyTorch reference.</li>
+    <li>Not done: turning the program into a static-shape export, building an <code>.hxb</code>, and running it on the board.</li>
+  </ul>
+</main>
