@@ -3,7 +3,7 @@
 Build the model graph with MAX (`max.nn` / `max.pipelines`), convert it to `hexagon::` ops, and hand
 that program to the existing hexagon_torch back end (memory plan, `.hxb`, device server, DSP kernels).
 It replaces the `torch.export` front end and the pattern matching in `hexagon_torch/lower.py`.
-Design question and trade-offs: [`../../max_hexagon_scope.md`](../../max_hexagon_scope.md).
+Design question and trade-offs: [`SCOPE.md`](SCOPE.md).
 
 ![Path from a Hugging Face checkpoint to the Hexagon cDSP: the MAX front end and the torch.export front end meet at one hexagon:: program, then hexagon_torch builds an .hxb, the device server loads it, and the Mojo kernel skeleton runs it on the cDSP.](max_path.svg)
 
@@ -15,18 +15,21 @@ page, generated from it.*
 
 | Step | What | State |
 |---|---|---|
-| S1 | MAX's Llama3 and Qwen3 graphs read into an op table ([`../max_s1`](../max_s1/README.md)) | done |
+| S1 | MAX's Llama3 and Qwen3 graphs read into an op table ([`probe_graphs/`](probe_graphs/README.md)) | done |
 | S2 | `max_lower.py`: a Llama3 decoder block equals `lower.py`'s output | done, host emulator |
 | S3a | TinyLlama, 22 layers, 12 greedy tokens equal to the fp32 PyTorch reference | done, host emulator |
 | S3b | static-shape export, memory plan, `.hxb`, run on the DSP | **not started** (needs a `Session` on the shared board `vq`) |
 | later | Qwen3 (per-head RMSNorm, sliced weights), W4 weights, ModuleV3 models | open |
+
+Last verified 2026-10-07 against `mhoffma/hvxhmx_mojo` `037b8f0`: `test_max_lower_block.py` 3 passed
+(max |diff| vs `lower.py` 1.95e-3, 92.0% bit-equal; the earlier analysis was against `1706124`).
 
 ## Use
 
 ```sh
 # venv: max==26.6.0, CPU torch, pytest, numpy, huggingface_hub, transformers, requests, pillow, av,
 # llguidance, pydantic (importing max.pipelines pulls in the serving dependencies)
-export HVXHMX_REPO=<checkout of mhoffma/hvxhmx_mojo>          # supplies hexagon_torch
+export HVXHMX_REPO=<current checkout of mhoffma/hvxhmx_mojo>   # supplies hexagon_torch (it is not in this repo)
 
 python -m pytest -q -s test_max_lower_block.py -p no:logging  # one block vs lower.py and PyTorch
 python run_tinyllama.py <TinyLlama-1.1B-Chat-v1.0 dir> "Qualcomm is" 12 22 out.json   # ~1 min pack, ~30 s/token
@@ -39,6 +42,8 @@ python ref_tinyllama.py <same dir> "Qualcomm is" 12 ref.json                    
 | `build_block.py`, `build_model.py` | MAX graphs: one decoder block with given weights; a whole model from a HF `config.json` with lazy safetensors weights |
 | `test_max_lower_block.py` | the S2 gate |
 | `run_tinyllama.py`, `ref_tinyllama.py` | the S3a run and its reference; logs in `results/` |
+| `probe_graphs/` | S1: the tiny Llama3 and Qwen3 MAX graphs as MLIR, their build scripts and an op-table printer |
+| `SCOPE.md` | the scoping paper: options, trade-offs, step plan |
 | `max_path.svg`, `build_diagram.py`, `path_diagram.template.html`, `path_diagram.html` | the picture above and its page |
 
 ## Maintaining this document and the picture
@@ -65,7 +70,7 @@ python ref_tinyllama.py <same dir> "Qualcomm is" 12 ref.json                    
 
 ```sh
 # a venv with: max==26.6.0 torch (cpu) pytest numpy huggingface_hub transformers requests pillow av llguidance pydantic ...
-# (see ../max_s1/README.md for the import dependencies)
+# (see probe_graphs/README.md for the import dependencies)
 HVXHMX_REPO=<checkout of mhoffma/hvxhmx_mojo> python -m pytest -q -s test_max_lower_block.py -p no:logging
 ```
 

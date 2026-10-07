@@ -4,11 +4,11 @@ Status: scoping draft, 2026-10-07. Based on a read of `mhoffma/hvxhmx_mojo` (`he
 `device_control/`, `BUILD.md`) and the installed `max 26.6.0` / `mojo 1.1.0` in `~/fun/.venv`.
 Nothing here has been run on the board. Items marked **[verify]** are unconfirmed.
 
-![The path from a checkpoint to the Hexagon cDSP with MAX as the front end](research/max_s2/max_path.svg)
+![The path from a checkpoint to the Hexagon cDSP with MAX as the front end](max_path.svg)
 
 *The two front ends meet at one `hexagon::` program. Teal is new code; dashed boxes have not been run
-from the MAX front end. Source: `research/max_s2/max_path.svg`; the implementation notes are in
-`research/max_s2/README.md`.*
+from the MAX front end. Source: `mojo.max/max_path.svg`; the implementation notes are in
+`mojo.max/README.md`.*
 
 ## 1. Question
 
@@ -129,9 +129,9 @@ nothing from MAX.
 | Step | Work | Gate |
 |---|---|---|
 | S0 | **Done here**: MAX 26.6 installed, graph builds, IR prints, no Hexagon target | the facts in sections 3 and 4 |
-| S1 | **Done** (Llama3 and Qwen3, tiny config): `research/max_s1/`. ~15 op kinds; RMSNorm, QK-norm, RoPE+KV store and attention are single named ops; paged KV maps to a static cache at batch 1. | an op coverage table: **passed** |
-| S2 | **Done** (Llama3 block): `research/max_s2/`. A ~320-line converter over the MO ops; block lowers to exactly `lower.py`'s op multiset; 100% bit-equal to `lower.py` with the reference cos/sin table (92% with MAX's own fp32 table, max diff 2e-3). | block equals `lower.py`'s on `test_lower_block.py`: **passed** (emulator) |
-| S3 | **S3a done** (host emulator): TinyLlama, 22 layers, 12 greedy tokens identical to the fp32 PyTorch reference (cosine >= 0.999998); `research/max_s2/`. **S3b open**: static-shape export, memplan, `.hxb` and the DSP, which needs a `Session` on `vq`. | tokens identical to the current `.hxb`: **host half passed; DSP half not run** |
+| S1 | **Done** (Llama3 and Qwen3, tiny config): `probe_graphs/`. ~15 op kinds; RMSNorm, QK-norm, RoPE+KV store and attention are single named ops; paged KV maps to a static cache at batch 1. | an op coverage table: **passed** |
+| S2 | **Done** (Llama3 block): `mojo.max/`. A ~320-line converter over the MO ops; block lowers to exactly `lower.py`'s op multiset; 100% bit-equal to `lower.py` with the reference cos/sin table (92% with MAX's own fp32 table, max diff 2e-3). | block equals `lower.py`'s on `test_lower_block.py`: **passed** (emulator) |
+| S3 | **S3a done** (host emulator): TinyLlama, 22 layers, 12 greedy tokens identical to the fp32 PyTorch reference (cosine >= 0.999998); `mojo.max/`. **S3b open**: static-shape export, memplan, `.hxb` and the DSP, which needs a `Session` on `vq`. | tokens identical to the current `.hxb`: **host half passed; DSP half not run** |
 | S4 | Qwen3, then GGUF Q4_0 direct to `w4f16v2` | same perplexity as today (`hexagon_torch/perplexity.py`) |
 | S5 | A model hexagon_torch does not support (e.g. a gemma or granite variant) | works with converter additions only; this is the payoff test |
 | S6 (optional) | Option B on the board | MAX installs on aarch64; a decode call costs no more than today |

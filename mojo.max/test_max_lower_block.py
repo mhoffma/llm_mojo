@@ -2,7 +2,7 @@
 of the reference block (tests/test_lower_block.py) and the PyTorch reference.
 
 HVXHMX_REPO=<hvxhmx_mojo checkout> python -m pytest -q test_max_lower_block.py
-(needs torch + max==26.6.0 + the max.pipelines dependencies; see ../max_s1/README.md)"""
+(needs torch + max==26.6.0 + the max.pipelines dependencies; see probe_graphs/README.md)"""
 import os
 import sys
 
