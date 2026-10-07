@@ -30,8 +30,24 @@ class LazyHF:
         return self.f.get_tensor(key).float().numpy()
 
 
+def _no_gpu_allreduce():
+    """The legacy max Qwen3 builds an Allreduce layer, which opens an Accelerator even on one device (it is
+    never called there). Replace its constructor so a graph builds without a GPU."""
+    import max.nn.comm.allreduce as ar
+    from max.nn.layer import Module
+
+    def init(self, num_accelerators=1, **kw):
+        Module.__init__(self)
+        self.devices = []
+    ar.Allreduce.__init__ = init
+    import max.pipelines.architectures.qwen3.qwen3 as q
+    q.Allreduce = ar.Allreduce
+
+
 def _model(path, max_seq, n_layers):
     hf = json.load(open(os.path.join(path, "config.json")))
+    if hf.get("model_type") == "qwen3":
+        return _qwen3_model(path, hf, max_seq, n_layers)
     n_layers = n_layers or hf["num_hidden_layers"]
     d = DeviceRef.CPU()
     hd = hf["hidden_size"] // hf["num_attention_heads"]
@@ -70,14 +86,21 @@ def build_layers(path, i0, i1, max_seq=256):
     model, kv, hf = _model(path, max_seq, i1 - i0)
     d = DeviceRef.CPU()
     types = model.input_types(kv)
+    qwen = hasattr(model, "norm_shards")            # the distributed-style Qwen3: lists per device, a signal buffer input
+    kv_types = types[4:] if qwen else types[3:]
     hidden = TensorType(DType.float32, ["total_seq_len", hf["hidden_size"]], d)
-    with Graph("layers", input_types=[hidden, *types[1:]]) as g:
+    rows_t = types[1]
+    nl_t = types[2]
+    with Graph("layers", input_types=[hidden, rows_t, nl_t, *kv_types]) as g:
         h, rows, _n_logits, *kv_in = g.inputs
         kvc = kv.unflatten_kv_inputs(iter(kv_in)).inputs[0]
         x = h.tensor
         for j, layer in enumerate(model.layers):
-            x = layer(ops.constant(j, DType.uint32, device=DeviceRef.CPU()), x, kvc,
-                      freqs_cis=model.rope.freqs_cis, input_row_offsets=rows.tensor)
+            idx = ops.constant(j, DType.uint32, device=DeviceRef.CPU())
+            if qwen:
+                x = layer(idx, [x], [kvc], [model.rope.freqs_cis], [rows.tensor], [])[0]
+            else:
+                x = layer(idx, x, kvc, freqs_cis=model.rope.freqs_cis, input_row_offsets=rows.tensor)
         g.output(x)
     return g, LazyHF(path, i0)
 
@@ -90,5 +113,34 @@ def build_head(path, max_seq=256):
     model, kv, hf = _model(path, max_seq, 1)
     hidden = TensorType(DType.float32, ["total_seq_len", hf["hidden_size"]], DeviceRef.CPU())
     with Graph("head", input_types=[hidden]) as g:
-        g.output(model.lm_head(model.norm(g.inputs[0].tensor)))
+        x = g.inputs[0].tensor
+        if hasattr(model, "norm_shards"):
+            g.output(model.norm_shards[0](x) @ model.lm_head.weight.T)    # (ColumnParallelLinear gathers across devices: one here)
+        else:
+            g.output(model.lm_head(model.norm(x)))
     return g, LazyHF(path)
+
+
+def _qwen3_model(path, hf, max_seq, n_layers):
+    """MAX's legacy Qwen3 (QK-norm, explicit head_dim, tied embeddings) for a checkpoint's config."""
+    from max.pipelines.architectures.qwen3.model_config import Qwen3Config
+    from max.pipelines.architectures.qwen3.qwen3 import Qwen3
+    _no_gpu_allreduce()
+    n_layers = n_layers or hf["num_hidden_layers"]
+    d = DeviceRef.CPU()
+    hd = hf.get("head_dim") or hf["hidden_size"] // hf["num_attention_heads"]
+    kv = MHAKVCacheParams(dtype=DType.float32, n_kv_heads=hf["num_key_value_heads"], head_dim=hd,
+                          num_layers=n_layers, devices=[d])
+    cfg = Qwen3Config(
+        hidden_size=hf["hidden_size"], num_attention_heads=hf["num_attention_heads"],
+        num_key_value_heads=hf["num_key_value_heads"], num_hidden_layers=n_layers, rope_theta=hf["rope_theta"],
+        rope_scaling_params=None, max_seq_len=max_seq, intermediate_size=hf["intermediate_size"],
+        interleaved_rope_weights=False, vocab_size=hf["vocab_size"], dtype=DType.float32,
+        model_quantization_encoding=None, quantization_config=None, kv_params=kv, rms_norm_eps=hf["rms_norm_eps"],
+        attention_multiplier=hd ** -0.5, embedding_multiplier=1.0, residual_multiplier=1.0, devices=[d],
+        clip_qkv=None, tie_word_embeddings=hf.get("tie_word_embeddings", False), use_subgraphs=False)
+    model = Qwen3(cfg)
+    sd = {k: np.broadcast_to(np.float32(0), [int(x) for x in w.shape])
+          for k, w in model.raw_state_dict().items() if "rope" not in k}
+    model.load_state_dict(sd, override_quantization_encoding=True, weight_alignment=1, strict=False)
+    return model, kv, hf

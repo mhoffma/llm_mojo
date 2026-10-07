@@ -1,17 +1,17 @@
-"""The PyTorch fp32 reference for run_tinyllama.py: hexagon_torch's own Llama (models/llama.py) greedy decode."""
+"""The PyTorch fp32 reference: hexagon_torch's own model (models/: Llama-family or Qwen3) greedy decode."""
 import json
 import sys
 
 import torch
 
 import max_lower  # noqa: F401  (puts HVXHMX_REPO on sys.path)
-from hexagon_torch.models import llama
+from hexagon_torch import models
 
 path, prompt, n_new, out = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 from transformers import AutoTokenizer
 tok = AutoTokenizer.from_pretrained(path)
 ids = tok(prompt, return_tensors="pt").input_ids
-model = llama.load(path, max_seq=256).eval()
+model = models.load(path, max_seq=256).eval()          # Llama-family or Qwen3
 toks, logits, pos, cur = [], [], 0, ids
 with torch.no_grad():
     for _ in range(n_new):

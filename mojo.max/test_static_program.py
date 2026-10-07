@@ -18,16 +18,17 @@ sys.path.insert(0, os.path.dirname(__file__))
 import max_lower  # noqa: E402
 import build_model  # noqa: E402
 from hexagon_torch import lower, memplan  # noqa: E402
+from hexagon_torch import models  # noqa: E402
 from hexagon_torch.models import llama  # noqa: E402
 
-CKPT = os.environ.get("TINYLLAMA_DIR")
-pytestmark = pytest.mark.skipif(not CKPT, reason="set TINYLLAMA_DIR to a TinyLlama checkpoint directory")
+CKPT = os.environ.get("MODEL_DIR") or os.environ.get("TINYLLAMA_DIR")      # a Llama-family or Qwen3 checkpoint directory
+pytestmark = pytest.mark.skipif(not CKPT, reason="set MODEL_DIR to a checkpoint directory (TinyLlama, Qwen3-0.6B)")
 LAYERS, MAX_SEQ = 2, 256
 
 
 @pytest.fixture(scope="module")
 def model():
-    return llama.load(CKPT, max_seq=MAX_SEQ, n_layers=LAYERS)
+    return models.load(CKPT, max_seq=MAX_SEQ, n_layers=LAYERS)
 
 
 def hexagon_ops(ep):
@@ -61,7 +62,8 @@ def describe(ep):
 
 
 WEIGHTS = {"f16": lambda: "f16", "w4f16v2": lambda: "w4f16v2",
-           "w4_mixed": lambda: lower.WeightPolicy("w4f16v2", keep=("k", "L1.down"))}     # (a policy per call: .at() is pure)
+           "w4_mixed": lambda: lower.WeightPolicy("w4f16v2", keep=("k", "L1.down")),
+           "w4_recipe": lambda: lower.WeightPolicy("w4f16v2", keep=("k", "v", "L1.down"))}   # (Qwen3's recipe, searched scales aside)     # (a policy per call: .at() is pure)
 
 
 def policy_of(weights):
@@ -103,7 +105,8 @@ def test_layers_program_equals_lower_py(model, rows, wname):
     assert pl(pa, na) == pl(pb, nb)
     # The one deliberate difference: lower.py registers its own cos / sin tables for each RoPE call (q and k),
     # max_lower shares one pair per layer between them: 2 fewer 32 KiB arena regions per layer, same bytes.
-    rope_tables = lambda p: [r for r in p.regions if r.kind == "weights" and r.place == "arena" and r.bytes == 256 * 32 * 4]
+    table_bytes = MAX_SEQ * (model.cfg.head_dim // 2) * 4          # one cos or sin table: [max_seq, head_dim / 2] fp32
+    rope_tables = lambda p: [r for r in p.regions if r.kind == "weights" and r.place == "arena" and r.bytes == table_bytes]
     assert len(rope_tables(pb)) - len(rope_tables(pa)) == 2 * LAYERS, (len(rope_tables(pa)), len(rope_tables(pb)))
     rest = lambda p: [(r.kind, r.place, r.offset, r.bytes) for r in p.regions if r not in rope_tables(p)]
     assert rest(pa) == rest(pb)

@@ -30,12 +30,14 @@ def main():
     p.add_argument("--head-weights", default="f16", choices=["f16", "w4f16", "w4f16v2"])
     p.add_argument("--keep-f16", default="", help="linears kept fp16 under a W4 --weights: kinds (k), layers (L2), L2.down")
     p.add_argument("--rounding", default="ref", choices=["ref", "search"])
+    p.add_argument("--max-tables", action="store_true", help="keep MAX's own fp32 RoPE tables (default: the reference's fp64 ones)")
     p.add_argument("--stock", action="store_true", help="use hexagon_torch's own torch.export front end")
     a = p.parse_args()
     from hexagon_torch import export_blob, generate
     if not a.stock:
         import gen_max
         gen_max.MaxGenerator.checkpoint = os.path.abspath(a.model)
+        gen_max.MaxGenerator.exact_tables = not a.max_tables
         generate.Generator = gen_max.MaxGenerator              # export_blob._export imports it at call time
     weights = a.weights
     if a.keep_f16 or a.rounding != "ref":

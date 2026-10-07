@@ -21,6 +21,7 @@ import build_model
 
 class MaxGenerator(Generator):
     checkpoint = None          # the checkpoint directory (set by export_mojomax.py before Generator is built)
+    exact_tables = True        # RoPE tables as hexagon_torch's reference computes them (fp64, rounded once), not MAX's fp32
 
     def _program(self, mod, rows, weights="f16", kv8=None):
         if kv8 is not None:
@@ -30,12 +31,11 @@ class MaxGenerator(Generator):
         if isinstance(mod, llama.Layers):
             graph, w = build_model.build_layers(self.checkpoint, mod.i0, mod.i1, max_seq=cfg.max_seq)
         elif isinstance(mod, llama.Head):
-            if len(mod.slices):
-                raise NotImplementedError("a vocabulary wider than one DSP tensor (head slices)")
             graph, w = build_model.build_head(self.checkpoint, max_seq=cfg.max_seq)
         else:
             raise TypeError(type(mod))
-        gm, _ = max_lower.convert(graph, w, t=rows, pos=0, max_seq=cfg.max_seq, batched=True, policy=policy)
+        gm, _ = max_lower.convert(graph, w, t=rows, pos=0, max_seq=cfg.max_seq, batched=True, policy=policy,
+                                  exact_tables=self.exact_tables)
         with torch.no_grad():
             low = torch.export.export(gm, (torch.randn(1, rows, cfg.hidden),))
         return Program(self.s, low, memplan.plan_memory(low, self.s.vtcm_bytes, context=self.context), kv8=kv8)

@@ -30,7 +30,7 @@
     </div>
     <figcaption>One program, two ways to make it. MAX replaces the torch.export front end and the regex lowering in <code>lower.py</code>; the <code>hexagon::</code> ops, memory plan, container, server and DSP kernels are shared.</figcaption>
     <ul class="legend" aria-label="Legend">
-      <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>every box has run: MAX front end to DSP, 12/12 tokens</li>
+      <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>every box has run: MAX front end to DSP, TinyLlama and Qwen3-0.6B</li>
       <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" style="fill:var(--accent-bg);stroke:var(--accent)" stroke-width="2"/></svg>new code in the MAX scoping work</li>
     </ul>
   </figure>
@@ -39,7 +39,7 @@
   <ul class="facts">
     <li>The MAX graph and <code>max_lower.py</code> are built. A decoder block matches <code>lower.py</code>'s op set exactly and its output bit for bit when the RoPE table is the same.</li>
     <li>TinyLlama, all 22 layers, generated 12 greedy tokens through this path on the host emulator, identical to the fp32 PyTorch reference.</li>
-    <li>On the board, the container built from the MAX programs generates the same 12 tokens as the fp32 reference and as the stock container, at the same speed (about 88 ms per token with fp16 weights). Twelve of its 13 sections are byte for byte the stock container's; the weights arena differs only in the RoPE tables, by at most 2e-5.</li>
-    <li>Not done yet: W4 weights, Qwen3, int8 KV caches, and a longer-prompt check.</li>
+    <li>On the board, the container built from the MAX programs generates the same 12 tokens as the fp32 reference and as the stock container, at the same speed (about 88 ms per token with fp16 weights). Its packed weights are the stock container's, byte for byte, and only the RoPE tables differ.</li>
+    <li>Also done: W4 (Q4_0) weights and Qwen3-0.6B, with the W4 recipe, at about 41 ms per token. Not done yet: int8 KV caches, longer prompts, and a quality measure for the MAX-made W4 containers.</li>
   </ul>
 </main>

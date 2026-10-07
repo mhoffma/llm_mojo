@@ -18,8 +18,9 @@ page, generated from it.*
 | S1 | MAX's Llama3 and Qwen3 graphs read into an op table ([`probe_graphs/`](probe_graphs/README.md)) | done |
 | S2 | `max_lower.py`: a Llama3 decoder block equals `lower.py`'s output | done, host emulator |
 | S3a | TinyLlama, 22 layers, 12 greedy tokens equal to the fp32 PyTorch reference | done, host emulator |
-| S3b | static-shape export, memory plan, `.hxb`, run on the DSP | done, fp16 and W4: 12/12 tokens on the DSP; containers equal the stock ones except the RoPE tables |
-| later | Qwen3 (per-head RMSNorm, sliced weights, heads wider than one DSP tensor), int8 KV caches, ModuleV3 models, longer prompts | open |
+| S3b | static-shape export, memory plan, `.hxb`, run on the DSP | done, fp16 and W4: 12/12 tokens on the DSP; same packed weights as the stock containers |
+| Qwen3 | Qwen3-0.6B: per-head QK-norm, sliced head, tied embeddings, fp16 and the W4 recipe | done: 12/12 tokens on the DSP |
+| later | int8 KV caches, ModuleV3 models, longer prompts and a quality measure (perplexity) for the MAX-made W4 containers | open |
 
 Last verified 2026-10-07 against `mhoffma/hvxhmx_mojo` `037b8f0` (and a DSP library built from it): `test_max_lower_block.py` 3 passed
 (max |diff| vs `lower.py` 1.95e-3, 92.0% bit-equal; the earlier analysis was against `1706124`).
@@ -221,7 +222,45 @@ PID when you start a process and kill that PID.
 
 ## Limits
 
-- fp16 and Q4_0 weights (fp16 or W4 head); no int8 KV; the head must fit one DSP tensor
-  (vocabulary <= 32,768; TinyLlama's is 32,000); one prompt of 4 tokens and 12 generated tokens.
+- fp16 and Q4_0 weights (fp16 or W4 head, a keep-fp16 policy); no int8 KV; short prompts (3-4 tokens) and 12 generated
+  tokens per check; Llama-family and Qwen3 graphs from MAX's legacy models only.
 - The test runs against a DSP library built from the same `hvxhmx_mojo` commit as the Python side; a library
   built from a different commit may not match the container's patch tables.
+
+---
+
+# Qwen3 (0.6B) through the MAX front end
+
+MAX's legacy `Qwen3` model builds a graph that is Llama's plus per-head QK-norm, an explicit `head_dim` (128
+here, wider than hidden / heads), tied embeddings and a vocabulary of 151,936. `build_model` builds its
+layer-group and head graphs (it replaces the model's `Allreduce` layer, which opens a GPU even on one device
+and is never called there). `max_lower` gained what Qwen3 needs: constant slices (the one-device shards of
+every weight are full-range slices), `mo.reduce.rms_norm` on `[t, heads, head_dim]` -> `hexagon.head_rms_norm`,
+a 3-way QKV split whose q and k are normed and re-concatenated before `rope_split_store` (the v linear is
+emitted on first use, so the op order is `lower.py`'s), the layer number from a counter (Qwen3 splits QKV
+before the RoPE op sees the layer index), and a head wider than one DSP tensor emitted as slices of 32,768
+joined by a `cat`, as `models.llama.Head` does.
+
+## Results (2026-10-07, vq; checkpoint Qwen/Qwen3-0.6B, 28 layers, context 512, prefill 32 rows)
+
+| Check | Result |
+|---|---|
+| Offline gate (`test_static_program.py` with `MODEL_DIR=<Qwen3-0.6B>`: 2 layers at 32 and 1 rows in fp16, W4 and the W4 recipe; the head in fp16 and W4, 5 vocabulary slices) | 8 pass: 38 hexagon ops per layer program identical to `lower.py`'s, constants identical, VTCM plans identical |
+| fp16 containers (`results/q3_f16_container_compare.txt`) | 1,440.12 MB (MAX) and 1,440.24 MB (stock). Head weights, embedding, head schedule, placement and patch tables are byte-identical. The weights arena differs by 131,072 bytes and the decode and prefill schedules by the table offsets that follow, **because of a quirk of the stock export**: its layer 0 uses a RoPE cos table that is one fp32 ULP off in 421 of 32,768 entries, layers 1-27 the exact one, so the stock arena holds two cos tables where MAX holds one (MAX's own fp32 table, for every layer) |
+| Tokens on the DSP, prompt "Qualcomm is", 12 greedy | MAX 12/12 and stock 12/12, both equal to the fp32 PyTorch reference: "Qualcomm is a company that provides software and hardware solutions for the education sector" |
+| Speed, 3-token prompt (3 alternating runs each) | MAX: TTFT 66.5-69.2 ms, decode 59.7-61.9 ms/token (16.2-16.7 tok/s). Stock: TTFT 64.8-75.6 ms, decode 58.2-61.7 ms/token. Ranges overlap |
+
+### Qwen3 W4 recipe (`--weights w4f16v2 --head-weights w4f16v2 --keep-f16 k,v,L2.down`)
+
+| Check | Result |
+|---|---|
+| Containers | 739.73 MB (MAX) and 739.85 MB (stock) |
+| MAX container with MAX's own fp32 RoPE tables | **diverged from the stock W4 container and the fp32 reference at token 10** ("...solutions for educational institutions." against "...for the education sector"): 9/12 |
+| Cause | Page by page (4 KiB, by content hash) the two weights arenas hold the same packed weights; they differ only in the RoPE tables (MAX's fp32 table is up to 2.8e-5 off the reference's). Re-exporting the MAX container with the reference's tables (the default now, `exact_tables=True`; `--max-tables` keeps MAX's) gave 12/12. At fp16 the same table difference changes no token; Q4_0 flips a near-tie |
+| MAX container, reference tables | 12/12 identical to the stock W4 container and to the fp32 reference: "Qualcomm is a company that provides software and hardware solutions for the education sector". The MAX arena has **no page that the stock arena lacks**; the stock arena has 32 more (its layer-0 cos table, see above) |
+| Speed, 3-token prompt (3 alternating runs each) | MAX: TTFT 46-54 ms, decode 40.7-42.5 ms/token (23.5-24.6 tok/s). Stock: TTFT 44-48 ms, decode 40.4-41.3 ms/token. fp16 for comparison: about 60 ms |
+
+The table episode is worth remembering: a numerically small difference in a constant can move a greedy token
+when the weights are quantized. The MAX path therefore defaults to the reference's tables so its containers can
+be compared with the stock ones token for token. Whether MAX's own table is better or worse for quality is not
+measured (no perplexity run); the two outputs at token 10 are equally plausible.

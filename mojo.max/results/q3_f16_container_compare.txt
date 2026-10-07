@@ -1,0 +1,15 @@
+metadata                   135656 bytes  crc DIFFERENT  6 bytes differ
+    metadata['weights_arena_bytes']: 882622464 vs 882753536
+weights arena        length 882622464 vs 882753536
+head weights            311599104 bytes  crc same  identical
+embedding               311164928 bytes  crc same  identical
+decode schedule             56096 bytes  crc DIFFERENT  453 bytes differ
+head schedule                1696 bytes  crc same  identical
+prefill schedules         3928288 bytes  crc DIFFERENT  7248 bytes differ
+tag 8                         560 bytes  crc same  identical
+tag 9                        5392 bytes  crc same  identical
+tag 10                        152 bytes  crc same  identical
+prefill placement          312256 bytes  crc same  identical
+extra arenas                12288 bytes  crc same  identical
+prefill patch              202944 bytes  crc same  identical
+containers differ

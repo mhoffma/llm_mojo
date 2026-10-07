@@ -33,6 +33,7 @@ from hexagon_torch import layouts, lower, ops  # noqa: E402  (registers torch.op
 from hexagon_torch.pack import LAYOUT_VERSION, pack_linear_f16, pack_linear_w4, pack_rms_norm  # noqa: E402
 
 aten, H = torch.ops.aten, torch.ops.hexagon
+HEAD_SLICE = 32768          # a DSP tensor holds at most 1024 panels: models.llama.HEAD_SLICE
 _NP = {"f32": np.float32, "f64": np.float64, "f16": np.float16, "si64": np.int64, "ui32": np.uint32,
        "si32": np.int32, "bool": np.bool_}
 
@@ -106,7 +107,7 @@ class Converter:
         runtime: the program is forward(x, pos) and t is the number of rows of x."""
         self.g, self.weights, self.t, self.pos, self.max_seq = graph, weights, t, pos, max_seq
         self.policy = policy or lower.WeightPolicy("f16")   # a format per linear, by layer and kind (lower.WeightPolicy)
-        self.cur_layer = None       # the layer being converted (set by its attention ops)
+        self.n_attn = 0             # attention ops seen so far: the layer's number while its q/k/v are converted
         self.origin = {}            # fx node -> "o" (attention output) | "down" (SwiGLU output): names the matmul after it
         self.exact_tables = exact_tables   # fold MAX's cos/sin chain in fp64 (hexagon_torch's reference tables)
         self.batched = batched      # hidden input / output as [1, t, features] (a torch module's), t static
@@ -155,6 +156,11 @@ class Converter:
 
     def node(self, v):
         kind, x = self.val[v]
+        if kind == "lin":                          # a linear emitted on first use (see op_mo_split)
+            xin, w, name = x
+            node = self.linear(xin, w, name)
+            self.val[v] = ("fx", node)
+            return node
         if kind != "fx":
             raise NotImplementedError(f"expected a DSP value, got {kind}")
         return x
@@ -239,7 +245,12 @@ class Converter:
         if self.val[ins[0]][0] == "opaque":                   # input_row_offsets[1:]
             self.val[res[0]] = ("lastbase", None)
             return
-        raise NotImplementedError("slice of a non-opaque value")
+        if not self.is_const(ins[0]):
+            raise NotImplementedError("slice of a DSP value")
+        ape = lambda name: [int(v) for v in re.search(r"ape\[([^\]]*)\]", _attr(o, name)).group(1).split(",")]
+        x = self.const(ins[0])
+        idx = tuple(slice(a, b, c) for a, b, c in zip(ape("starts"), ape("stops"), ape("steps")))
+        self.val[res[0]] = ("const", x[idx])                   # (a one-device shard of a weight: the whole tensor)
 
     def op_rmo_sub(self, o, ins, res):
         if self.val[ins[0]][0] == "lastbase":
@@ -255,6 +266,13 @@ class Converter:
         self.val[res[0]] = self.val[ins[0]]                  # the program returns fp32 anyway
 
     # ---- aliases
+    def op_rmo_concat(self, o, ins, res):
+        if all(self.is_const(i) for i in ins):
+            return self.fold_default(o, ins, res)
+        if len(ins) != 3 or any(self.val[i][0] not in ("fx", "lin") for i in ins):
+            raise NotImplementedError("concat of DSP values other than Qwen3's q | k | v")
+        self.val[res[0]] = ("qkv", tuple(self.val[i] for i in ins))   # normed q and k, v (maybe not emitted yet)
+
     def op_rmo_reshape(self, o, ins, res):
         if self.is_const(ins[0]):
             shape, dt = _type(res[0])
@@ -269,11 +287,14 @@ class Converter:
     # ---- ops on the DSP
     def op_mo_reduce_rms_norm(self, o, ins, res):
         shape, _ = _type(ins[0])
-        if len(shape) != 2:
-            raise NotImplementedError("per-head rms_norm (Qwen3 QK-norm): S2 covers Llama3")
         gamma, eps = self.const(ins[1]), float(self.const(ins[2]))
         p = pack_rms_norm(gamma, eps)
         g = self.buffer("gamma", torch.from_numpy(p.gamma.copy()))
+        if len(shape) == 3:                        # [t, heads, head_dim]: Qwen3's QK-norm, one gamma per head dim
+            self.val[res[0]] = ("fx", self.call(H.head_rms_norm.default, self.node(ins[0]), g, eps, p.k, LAYOUT_VERSION))
+            return
+        if len(shape) != 2:
+            raise NotImplementedError(f"rms_norm of rank {len(shape)}")
         self.val[res[0]] = ("fx", self.call(H.rms_norm.default, self.node(ins[0]), g, eps, p.k, LAYOUT_VERSION))
 
     def target(self, kind):
@@ -281,7 +302,8 @@ class Converter:
         if kind == "lm_head":
             return "lm_head.weight"
         part = "attn" if kind in ("q", "k", "v", "o") else "mlp"
-        return f"blks.{self.cur_layer}.{part}.{kind}_proj.weight"
+        layer = self.n_attn if kind in ("q", "k", "v") else self.n_attn - 1      # (q/k/v come before their layer's attention op)
+        return f"blks.{layer}.{part}.{kind}_proj.weight"
 
     def pack(self, w_out_in, target):
         """The linear's packing in the format the policy gives its name (f16, or Q4_0 expanded on the DSP),
@@ -311,7 +333,13 @@ class Converter:
         kind, x = self.val[v]
         if kind == "matmul":
             xin, w = x
-            node = self.linear(xin, np.ascontiguousarray(w.T), self.origin.get(xin, "lm_head"))
+            role = self.origin.get(xin, "lm_head")
+            if role == "lm_head" and w.shape[1] > HEAD_SLICE:       # a head wider than a DSP tensor: slices joined on the host
+                nodes = [self.linear(xin, np.ascontiguousarray(w[:, a:a + HEAD_SLICE].T), role)
+                         for a in range(0, w.shape[1], HEAD_SLICE)]
+                self.val[v] = ("slices", nodes)
+                return nodes
+            node = self.linear(xin, np.ascontiguousarray(w.T), role)
             self.val[v] = ("fx", node)
             return node
         return self.node(v)
@@ -320,12 +348,16 @@ class Converter:
         kind, (xin, w) = self.val[ins[0]]
         assert kind == "matmul", "split of a non-matmul"
         sizes = [_type(r)[0][-1] for r in res]
-        kinds = {2: ("gate", "up")}.get(len(res))
+        kinds = {2: ("gate", "up"), 3: ("q", "k", "v")}.get(len(res))
         if kinds is None:
             raise NotImplementedError(f"a {len(res)}-way split of a matmul")
         off = 0
-        for r, n, kind in zip(res, sizes, kinds):
-            self.val[r] = ("fx", self.linear(xin, np.ascontiguousarray(w[:, off:off + n].T), kind))
+        for i, (r, n, kind) in enumerate(zip(res, sizes, kinds)):
+            piece = np.ascontiguousarray(w[:, off:off + n].T)
+            if len(res) == 3 and i == 2:           # Qwen3's v: the source order is q, k, their norms, then v
+                self.val[r] = ("lin", (xin, piece, kind))
+            else:
+                self.val[r] = ("fx", self.linear(xin, piece, kind))
             off += n
 
     def op_rmo_mo_silu(self, o, ins, res):
@@ -368,8 +400,8 @@ class Converter:
         if _param(o, "interleaved") != "false":
             raise NotImplementedError("interleaved RoPE")
         qkv_v, freqs = ins[0], self.const(ins[2])
-        kind, (xin, w) = self.val[qkv_v]
-        assert kind == "matmul", "rope_split_store of a non-matmul"
+        kind, payload = self.val[qkv_v]
+        assert kind in ("matmul", "qkv"), f"rope_split_store of {kind}"
         kv_shape = _type_buffer(ins[3])                 # [pages, 2, layers, page, n_kv, head_dim]
         n_kv, hd = kv_shape[-2], kv_shape[-1]
         n_q = _type(res[0])[0][-1] // hd
@@ -379,10 +411,14 @@ class Converter:
         sin = np.ascontiguousarray(freqs[:self.max_seq, 1::2], np.float32)
         ct, st = self.buffer("cos", torch.from_numpy(cos)), self.buffer("sin", torch.from_numpy(sin))
         qn, kn = n_q * hd, n_kv * hd
-        self.cur_layer = int(self.const(ins[8]))
-        q = self.linear(xin, np.ascontiguousarray(w[:, :qn].T), "q")
-        k = self.linear(xin, np.ascontiguousarray(w[:, qn:qn + kn].T), "k")
-        v = self.linear(xin, np.ascontiguousarray(w[:, qn + kn:qn + 2 * kn].T), "v")
+        assert int(self.const(ins[8])) == self.n_attn, "layer order"
+        if kind == "qkv":                          # Qwen3: split and QK-normed before the op
+            q, k, v = (self.linear(*x) if kd == "lin" else x for kd, x in payload)
+        else:
+            xin, w = payload
+            q = self.linear(xin, np.ascontiguousarray(w[:, :qn].T), "q")
+            k = self.linear(xin, np.ascontiguousarray(w[:, qn:qn + kn].T), "k")
+            v = self.linear(xin, np.ascontiguousarray(w[:, qn + kn:qn + 2 * kn].T), "v")
         t = self.t
         q = self.call(H.rope.default, q, ct, st, self.pos, t, hd, LAYOUT_VERSION)
         k = self.call(H.rope.default, k, ct, st, self.pos, t, hd, LAYOUT_VERSION)
@@ -400,18 +436,29 @@ class Converter:
         if mask != "causal":
             raise NotImplementedError(f"mask {mask}")
         scale = float(self.const(ins[8]))
+        if abs(scale - self.hd ** -0.5) <= 1e-6 * scale:
+            scale = 0.0                            # the op's default (1 / sqrt(head_dim)), as lower.py leaves it
         kc, vc = self.cache_nodes[int(self.const(ins[7]))]
         y = self.call(H.scaled_dot_product_attention.default, self.node(ins[0]), kc, vc, self.pos,
                       self.n_heads, self.n_kv, self.hd, self.max_seq, True, scale, LAYOUT_VERSION)
         self.origin[y] = "o"
+        self.n_attn += 1
         self.val[res[0]] = ("fx", y)
 
     # ---- result
     def finish(self):
         y = self.materialize(self.out)
-        if self.batched:
-            y = self.fx.call_function(aten.reshape.default, (y, [1, self.t, _type(self.out)[0][-1]]))
-        self.fx.output(self.fx.call_function(aten._to_copy.default, (y,), {"dtype": torch.float32}))
+        if isinstance(y, list):                                     # sliced head: cat over the last dim, as models.llama.Head
+            parts = []
+            for n, a in zip(y, range(0, _type(self.out)[0][-1], HEAD_SLICE)):
+                width = min(HEAD_SLICE, _type(self.out)[0][-1] - a)
+                n = self.fx.call_function(aten.reshape.default, (n, [1, self.t, width])) if self.batched else n
+                parts.append(self.fx.call_function(aten._to_copy.default, (n,), {"dtype": torch.float32}))
+            self.fx.output(self.fx.call_function(aten.cat.default, (parts, -1)))
+        else:
+            if self.batched:
+                y = self.fx.call_function(aten.reshape.default, (y, [1, self.t, _type(self.out)[0][-1]]))
+            self.fx.output(self.fx.call_function(aten._to_copy.default, (y,), {"dtype": torch.float32}))
         root = torch.nn.Module()
         for n, tns in self.gm_buffers.items():
             root.register_buffer(n, tns)
