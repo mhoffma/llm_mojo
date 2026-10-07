@@ -29,7 +29,7 @@ HVXHMX = os.environ.get("HVXHMX_REPO")
 if HVXHMX and HVXHMX not in sys.path:
     sys.path.insert(0, HVXHMX)
 
-from hexagon_torch import layouts, ops  # noqa: E402  (registers torch.ops.hexagon.*)
+from hexagon_torch import layouts, lower, ops  # noqa: E402  (registers torch.ops.hexagon.*)
 from hexagon_torch.pack import LAYOUT_VERSION, pack_linear_f16, pack_rms_norm  # noqa: E402
 
 aten, H = torch.ops.aten, torch.ops.hexagon
@@ -101,10 +101,12 @@ def _fold(name, op, ins, shape, dt):
 
 
 class Converter:
-    def __init__(self, graph, weights, t=None, pos=None, max_seq=256):
+    def __init__(self, graph, weights, t=None, pos=None, max_seq=256, batched=False, exact_tables=False):
         """t, pos: ints bake the sequence length / position into the program (S2); None makes them
         runtime: the program is forward(x, pos) and t is the number of rows of x."""
         self.g, self.weights, self.t, self.pos, self.max_seq = graph, weights, t, pos, max_seq
+        self.exact_tables = exact_tables   # fold MAX's cos/sin chain in fp64 (hexagon_torch's reference tables)
+        self.batched = batched      # hidden input / output as [1, t, features] (a torch module's), t static
         self.fx = torch.fx.Graph()
         self.gm_buffers = {}
         self.val = {}               # mlir value -> ("const", ndarray) | ("lazy", name) | ("fx", node) | ...
@@ -128,6 +130,11 @@ class Converter:
 
     def f16(self, x):
         return self.fx.call_function(aten._to_copy.default, (x,), {"dtype": torch.float16})
+
+    def fdt(self, dt):
+        """The dtype to fold a constant in: with exact_tables, fp32 chains (MAX's in-graph cos/sin table)
+        run in fp64 and round once at the consumer, as hexagon_torch's rope_tables does."""
+        return "f64" if self.exact_tables and dt == "f32" else dt
 
     # -- lookup
     def const(self, v):
@@ -160,6 +167,9 @@ class Converter:
             self.t = self.fx.call_function(aten.sym_size.int, (x, 0))
         if _type(args[0])[1] == "si64":                       # token ids: the embedding is a host gather
             self.val[args[0]] = ("tokens", x)
+        elif self.batched:
+            x2 = self.fx.call_function(aten.reshape.default, (x, [self.t, _type(args[0])[0][-1]]))
+            self.val[args[0]] = ("fx", self.f16(x2))
         else:
             self.val[args[0]] = ("fx", self.f16(x))
         for a in args[1:]:
@@ -187,7 +197,7 @@ class Converter:
                 h(o, ins, res)
             elif all(self.val.get(i, ("", 0))[0] in ("const", "lazy") for i in ins) and res:
                 shape, dt = _type(res[0])
-                out = _fold(name, o, [self.const(i) for i in ins], shape, dt)
+                out = _fold(name, o, [self.const(i) for i in ins], shape, self.fdt(dt))
                 if out is None:
                     raise NotImplementedError(f"cannot fold {name}")
                 self.val[res[0]] = ("const", out)
@@ -263,8 +273,18 @@ class Converter:
         g = self.buffer("gamma", torch.from_numpy(p.gamma.copy()))
         self.val[res[0]] = ("fx", self.call(H.rms_norm.default, self.node(ins[0]), g, eps, p.k, LAYOUT_VERSION))
 
+    def pack(self, w_out_in):
+        """pack_linear_f16, through hexagon_torch's pack cache when one is open (lower.pack_cache():
+        Generator opens one and fills it from worker processes before the programs are built)."""
+        if lower._cache is None:
+            return pack_linear_f16(w_out_in, None)
+        key = lower.fingerprint(w_out_in, None, ("f16", "ref"))
+        if key not in lower._cache:
+            lower.cache_put(key, pack_linear_f16(w_out_in, None))
+        return lower._cache[key]
+
     def linear(self, x, w_out_in):
-        p = pack_linear_f16(w_out_in, None)
+        p = self.pack(w_out_in)
         wn = self.buffer("w", torch.from_numpy(p.weights.copy()))
         bn = self.buffer("bt", torch.from_numpy(p.bias_table.view(np.int32).copy()))
         return self.call(H.linear.default, x, wn, bn, p.fmt, p.k, p.n, LAYOUT_VERSION)
@@ -309,7 +329,7 @@ class Converter:
 
     def fold_default(self, o, ins, res):
         shape, dt = _type(res[0])
-        self.val[res[0]] = ("const", _fold(o.name, o, [self.const(i) for i in ins], shape, dt))
+        self.val[res[0]] = ("const", _fold(o.name, o, [self.const(i) for i in ins], shape, self.fdt(dt)))
 
     def op_rmo_add(self, o, ins, res):
         if all(self.is_const(i) for i in ins):
@@ -369,6 +389,8 @@ class Converter:
     # ---- result
     def finish(self):
         y = self.materialize(self.out)
+        if self.batched:
+            y = self.fx.call_function(aten.reshape.default, (y, [1, self.t, _type(self.out)[0][-1]]))
         self.fx.output(self.fx.call_function(aten._to_copy.default, (y,), {"dtype": torch.float32}))
         root = torch.nn.Module()
         for n, tns in self.gm_buffers.items():
@@ -382,11 +404,11 @@ def _type_buffer(v):
     return [int(d) if d.strip().isdigit() else d.strip() for d in m.group(1).split(",")]
 
 
-def convert(graph, weights, t=None, pos=None, max_seq=256):
+def convert(graph, weights, t=None, pos=None, max_seq=256, batched=False, exact_tables=False):
     """MAX Graph (one block: input [t, hidden], kv inputs) -> (GraphModule of hexagon ops, op counts).
     The module takes x [t, hidden] fp32 and returns [t, hidden] fp32; its packed KV caches are the
     buffers named in `gm.caches`."""
-    c = Converter(graph, weights, t, pos, max_seq)
+    c = Converter(graph, weights, t, pos, max_seq, batched, exact_tables)
     gm, counts = c.run()
     gm.caches = c.caches if len(c.caches) != 1 else {"k": c.caches[0][0], "v": c.caches[0][1]}
     gm.layer_caches = c.caches

@@ -16,16 +16,21 @@ from max.pipelines.architectures.llama3.model_config import Llama3Config
 class LazyHF:
     """{MAX weight name: float32 ndarray}, read from the checkpoint's safetensors on access."""
 
-    def __init__(self, path):
+    def __init__(self, path, layer0=0):
+        """layer0: the checkpoint layer that the graph's layer 0 is (a graph of layers [i0, i1))."""
         from safetensors import safe_open
         self.f = safe_open(os.path.join(path, "model.safetensors"), framework="pt")
+        self.layer0 = layer0
 
     def __getitem__(self, name):
+        if name.startswith("layers."):
+            _, i, rest = name.split(".", 2)
+            name = f"layers.{int(i) + self.layer0}.{rest}"
         key = name if name == "lm_head.weight" else "model." + name
         return self.f.get_tensor(key).float().numpy()
 
 
-def build(path, max_seq=2048, n_layers=None):
+def _model(path, max_seq, n_layers):
     hf = json.load(open(os.path.join(path, "config.json")))
     n_layers = n_layers or hf["num_hidden_layers"]
     d = DeviceRef.CPU()
@@ -45,8 +50,45 @@ def build(path, max_seq=2048, n_layers=None):
     sd = {k: np.broadcast_to(np.float32(0), [int(x) for x in w.shape])
           for k, w in model.raw_state_dict().items() if "rope" not in k}
     model.load_state_dict(sd, override_quantization_encoding=True, weight_alignment=1, strict=False)
+    return model, kv, hf
+
+
+def build(path, max_seq=2048, n_layers=None):
+    model, kv, hf = _model(path, max_seq, n_layers)
     with Graph("llama3", input_types=model.input_types(kv)) as g:
         tokens, rows, n_logits, *rest = g.inputs
         kvc = kv.unflatten_kv_inputs(iter(rest)).inputs
         g.output(*model(tokens.tensor, kvc[0], n_logits.tensor, rows.tensor))
+    return g, LazyHF(path)
+
+
+def build_layers(path, i0, i1, max_seq=256):
+    """Decoder layers [i0, i1) as a MAX graph: hidden states [total_seq_len, hidden] in, hidden states
+    out, the layers' KV caches as the paged-KV inputs (what hexagon_torch's `models.llama.Layers` is)."""
+    from max.dtype import DType
+    from max.graph import DeviceRef, TensorType, ops
+    model, kv, hf = _model(path, max_seq, i1 - i0)
+    d = DeviceRef.CPU()
+    types = model.input_types(kv)
+    hidden = TensorType(DType.float32, ["total_seq_len", hf["hidden_size"]], d)
+    with Graph("layers", input_types=[hidden, *types[1:]]) as g:
+        h, rows, _n_logits, *kv_in = g.inputs
+        kvc = kv.unflatten_kv_inputs(iter(kv_in)).inputs[0]
+        x = h.tensor
+        for j, layer in enumerate(model.layers):
+            x = layer(ops.constant(j, DType.uint32, device=DeviceRef.CPU()), x, kvc,
+                      freqs_cis=model.rope.freqs_cis, input_row_offsets=rows.tensor)
+        g.output(x)
+    return g, LazyHF(path, i0)
+
+
+def build_head(path, max_seq=256):
+    """The final RMSNorm and the output layer: hidden states [total_seq_len, hidden] -> logits
+    [total_seq_len, vocab] (what `models.llama.Head` is, for a vocabulary that fits one tensor)."""
+    from max.dtype import DType
+    from max.graph import DeviceRef, TensorType
+    model, kv, hf = _model(path, max_seq, 1)
+    hidden = TensorType(DType.float32, ["total_seq_len", hf["hidden_size"]], DeviceRef.CPU())
+    with Graph("head", input_types=[hidden]) as g:
+        g.output(model.lm_head(model.norm(g.inputs[0].tensor)))
     return g, LazyHF(path)
