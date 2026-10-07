@@ -7,7 +7,7 @@ Design question and trade-offs: [`SCOPE.md`](SCOPE.md).
 
 ![Path from a Hugging Face checkpoint to the Hexagon cDSP: the MAX front end and the torch.export front end meet at one hexagon:: program, then hexagon_torch builds an .hxb, the device server loads it, and the Mojo kernel skeleton runs it on the cDSP.](max_path.svg)
 
-*Teal: new code. Dashed: not yet run from the MAX front end. The picture's source is
+*Teal: new code. Every box has run from the MAX front end. The picture's source is
 [`max_path.svg`](max_path.svg); [`path_diagram.html`](path_diagram.html) is the same picture as a
 page, generated from it.*
 
@@ -18,10 +18,10 @@ page, generated from it.*
 | S1 | MAX's Llama3 and Qwen3 graphs read into an op table ([`probe_graphs/`](probe_graphs/README.md)) | done |
 | S2 | `max_lower.py`: a Llama3 decoder block equals `lower.py`'s output | done, host emulator |
 | S3a | TinyLlama, 22 layers, 12 greedy tokens equal to the fp32 PyTorch reference | done, host emulator |
-| S3b | static-shape export, memory plan, `.hxb`, run on the DSP | **not started** (needs a `Session` on the shared board `vq`) |
-| later | Qwen3 (per-head RMSNorm, sliced weights), W4 weights, ModuleV3 models | open |
+| S3b | static-shape export, memory plan, `.hxb`, run on the DSP | done: 12/12 tokens on the DSP; container equals the stock one except the RoPE tables |
+| later | W4 weights, Qwen3 (per-head RMSNorm, sliced weights), int8 KV caches, ModuleV3 models, longer prompts | open |
 
-Last verified 2026-10-07 against `mhoffma/hvxhmx_mojo` `037b8f0`: `test_max_lower_block.py` 3 passed
+Last verified 2026-10-07 against `mhoffma/hvxhmx_mojo` `037b8f0` (and a DSP library built from it): `test_max_lower_block.py` 3 passed
 (max |diff| vs `lower.py` 1.95e-3, 92.0% bit-equal; the earlier analysis was against `1706124`).
 
 ## Use
@@ -44,12 +44,17 @@ python ref_tinyllama.py <same dir> "Qualcomm is" 12 ref.json                    
 | `run_tinyllama.py`, `ref_tinyllama.py` | the S3a run and its reference; logs in `results/` |
 | `probe_graphs/` | S1: the tiny Llama3 and Qwen3 MAX graphs as MLIR, their build scripts and an op-table printer |
 | `SCOPE.md` | the scoping paper: options, trade-offs, step plan |
+| `gen_max.py` | `MaxGenerator`: hexagon_torch's `Generator` with its layer-group and head programs made from MAX graphs |
+| `export_mojomax.py` | exports an `.hxb` with `MaxGenerator` (or the stock front end with `--stock`) through a device server |
+| `run_dsp.py` | runs an `.hxb` on the DSP through a device server and compares the greedy tokens with `results/s3_ref.json` |
+| `test_static_program.py` | S3b offline gate: the MAX program equals `lower.lower()`'s for a group of layers and for the head |
+| `compare_hxb.py` | compares two `.hxb` containers section by section |
 | `max_path.svg`, `build_diagram.py`, `path_diagram.template.html`, `path_diagram.html` | the picture above and its page |
 
 ## Maintaining this document and the picture
 
-- **The picture is part of the feature.** When a stage changes state (S3b runs, a dashed box becomes
-  solid), a stage is added or renamed, or the flow changes, edit `max_path.svg` in the same commit as
+- **The picture is part of the feature.** When a stage changes state (a new stage is added dashed until it
+  has run, then drawn solid), a stage is renamed, or the flow changes, edit `max_path.svg` in the same commit as
   the code or the status table above. Keep the picture and the table saying the same thing.
 - Edit only `max_path.svg`; then `python3 build_diagram.py` regenerates `path_diagram.html`. Never
   edit the generated page by hand.
@@ -156,3 +161,52 @@ a fix to the type parser for dims like `add(n, -1)`.
 - **Not compared against `lower.py`'s program on the full model**, only on one block (S2: bit-equal
   with the same RoPE table). A fp32-reference comparison is weaker than a bit comparison.
 - **The gate is greedy equality over 12 tokens on one prompt**, with a 0.069 minimum margin.
+
+---
+
+# S3b: the MAX programs on the DSP (TinyLlama, fp16 weights)
+
+`gen_max.MaxGenerator` overrides `Generator._program`, which turns a module (layers [i0, i1) or the head)
+into a lowered, planned program for one row count. It builds a MAX graph of the same layers
+(`build_model.build_layers` / `build_head`), converts it with `max_lower.convert(..., batched=True)`, exports
+it and plans it with `memplan`. Everything after that is hexagon_torch's own: `Program`, the shared KV state,
+six 4-layer prefill programs of 32 rows, the 22-layer decode program, the head, `export_blob`.
+
+## Results (2026-10-07, vq: QCS8300, Hexagon v75, 1.4976 GHz; DSP library built from `037b8f0`, sha256 `b4b08e78...`)
+
+| Check | Result |
+|---|---|
+| Offline gate (`test_static_program.py`, 2 layers at 32 rows and at 1 row, and the head) | the 34 hexagon ops per program have identical arguments; every constant tensor (packed weights, gammas, bias tables, RoPE tables, initial caches) is identical byte for byte; the VTCM plan is identical (1,593,344 bytes peak). Two documented differences: MAX's own RoPE tables (below) and one shared cos/sin pair per layer instead of one per RoPE call |
+| Export through a device server on vq | 22 layers, 155 linears; DSP held 164 s; container 2,104.98 MB, 13 sections, the stock export's size |
+| Container vs the stock export (`results/s3b_container_compare.txt`) | 12 of 13 sections byte-identical: metadata, head weights, embedding, decode, head and prefill schedules, placement and patch tables. The weights arena differs in 19,865 of 1.94 GB bytes, all inside one 0.13 MB span: the RoPE tables (MAX builds them in fp32, the reference in fp64; max difference 1.8e-5). `exact_tables=True` should make them identical; not re-exported to confirm |
+| Tokens on the DSP, prompt "Qualcomm is", 12 greedy | MAX container 12/12 identical to the fp32 PyTorch reference; stock container 12/12 identical too |
+| Speed, 4-token prompt | MAX: TTFT 99-104 ms, decode 87.8-92.7 ms/token (4 runs). Stock: TTFT 98-103 ms, decode 87.6-88.8 ms/token (4 runs). The same schedules: the differences are the shared board's load |
+
+## Run it
+
+```sh
+export HVXHMX_REPO=<current checkout of mhoffma/hvxhmx_mojo>
+make -C $HVXHMX_REPO/hmx/layer liblayer_skel.so          # the DSP library; note its sha256
+# vq: your own directory, the library there and in the content store /tmp/vq_skels/<sha256>/, your own server
+#   (never the shared one on 9870): copy device_control/, write backend/active_backend.mojo as in BUILD.md
+#   section 6.2, build it, then START IT AND KEEP ITS PID:
+#       VQ_SERVER_PORT=9872 HEXAGON_LIB_DIR=... ./server_bin > server.log 2>&1 & echo $! > server.pid
+python export_mojomax.py --model <TinyLlama dir> --out x.hxb --remote tcp://10.168.168.32:9872 \
+    --lib-dir /home/mhoffman/hexagon/mojomax/lib --skel-hash <sha256>        # waits while another user holds the DSP
+scp x.hxb vq:hexagon/mojomax/exports/
+python run_dsp.py --container /home/mhoffman/hexagon/mojomax/exports/x.hxb --skel <sha256> --port 9872 --model <dir>
+kill $(cat server.pid)                                    # on vq, when done: by PID, never by name
+```
+
+**Never stop a server by name or pattern on vq.** On 2026-10-07 a `pkill -f "^./server_bin"` meant for the test
+server above also stopped the shared server on 9870 (and the sessions it had forked) for about two minutes;
+it was restarted with `cd ~/hexagon/device_control && nohup ./server_bin >> server.log 2>&1 &` (the Makefile's
+`start-server`), and a copy of its log, `server.log.before-restart-1791373867`, was left next to it. Record the
+PID when you start a process and kill that PID.
+
+## Limits
+
+- fp16 weights only (`MaxGenerator` refuses W4 policies); no int8 KV; the head must fit one DSP tensor
+  (vocabulary <= 32,768; TinyLlama's is 32,000); one prompt of 4 tokens and 12 generated tokens.
+- The test runs against a DSP library built from the same `hvxhmx_mojo` commit as the Python side; a library
+  built from a different commit may not match the container's patch tables.

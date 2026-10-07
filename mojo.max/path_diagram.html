@@ -28,13 +28,11 @@
           .row-label { font: 600 11px var(--font-mono); letter-spacing: .06em; }
           .box { fill: var(--box); stroke: var(--line); stroke-width: 1.5; }
           .box.new { fill: var(--accent-bg); stroke: var(--accent); stroke-width: 2; }
-          .box.todo { stroke-dasharray: 6 4; }
           .t { font: 600 13px var(--font-body); fill: var(--fg); }
           .s { font: 400 11.5px var(--font-mono); fill: var(--muted); }
           .new-t { fill: var(--accent); }
           .edge { fill: none; stroke: var(--line); stroke-width: 1.6; }
           .edge.new { stroke: var(--accent); stroke-width: 2.2; }
-          .edge.todo { stroke-dasharray: 6 4; }
           .elab { font: 400 11.5px var(--font-mono); fill: var(--muted); }
           .tag { font: 600 11.5px var(--font-mono); fill: var(--accent); }
           .arr { fill: var(--line); }
@@ -126,27 +124,29 @@
         <text class="s" x="693" y="175" text-anchor="middle">sdpa · swiglu · add</text>
         <text class="s" x="693" y="196" text-anchor="middle">fp16, packed HMX</text>
         <text class="s" x="693" y="210" text-anchor="middle">weights and caches</text>
-        <text class="tag" x="693" y="246" text-anchor="middle">run on host emulator</text>
-        <text class="elab" x="693" y="262" text-anchor="middle">12/12 tokens = fp32 ref</text>
+        <text class="tag" x="693" y="246" text-anchor="middle">12/12 tokens = fp32 ref</text>
+        <text class="elab" x="693" y="262" text-anchor="middle">host emulator and DSP</text>
 
         <!-- export -->
-        <path class="edge todo" d="M778 163 L808 163" marker-end="url(#a)"/>
-        <rect class="box todo" x="810" y="100" width="172" height="126" rx="5"/>
+        <path class="edge" d="M778 163 L808 163" marker-end="url(#a)"/>
+        <rect class="box" x="810" y="100" width="172" height="126" rx="5"/>
         <text class="t" x="896" y="124" text-anchor="middle">hexagon_torch</text>
         <text class="s" x="896" y="145" text-anchor="middle">static shapes</text>
         <text class="s" x="896" y="160" text-anchor="middle">memplan, 8 MB VTCM</text>
         <text class="s" x="896" y="175" text-anchor="middle">schedule bytecode</text>
         <text class="s" x="896" y="190" text-anchor="middle">export_blob</text>
         <text class="t" x="896" y="212" text-anchor="middle">→ .hxb</text>
+        <text class="tag" x="896" y="246" text-anchor="middle">12 of 13 sections</text>
+        <text class="elab" x="896" y="262" text-anchor="middle">= the stock .hxb</text>
 
         <!-- elbow to the board -->
-        <path class="edge todo" d="M896 226 L896 304 L130 304 L130 364" marker-end="url(#a)"/>
+        <path class="edge" d="M896 226 L896 304 L130 304 L130 364" marker-end="url(#a)"/>
         <text class="elab" x="513" y="298" text-anchor="middle">scp .hxb to vq</text>
 
         <!-- board band -->
         <rect class="box" x="22" y="366" width="216" height="92" rx="5"/>
         <text class="t" x="130" y="392" text-anchor="middle">device server</text>
-        <text class="s" x="130" y="412" text-anchor="middle">Mojo, port 9870</text>
+        <text class="s" x="130" y="412" text-anchor="middle">Mojo daemon, TCP</text>
         <text class="s" x="130" y="427" text-anchor="middle">rpcmem arenas, DSP lock</text>
         <text class="s" x="130" y="442" text-anchor="middle">patches the schedule</text>
 
@@ -173,8 +173,7 @@
     </div>
     <figcaption>One program, two ways to make it. MAX replaces the torch.export front end and the regex lowering in <code>lower.py</code>; the <code>hexagon::</code> ops, memory plan, container, server and DSP kernels are shared.</figcaption>
     <ul class="legend" aria-label="Legend">
-      <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>solid: exists and has run</li>
-      <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 3"/></svg>dashed: not yet run from the MAX front end</li>
+      <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>every box has run: MAX front end to DSP, 12/12 tokens</li>
       <li><svg viewBox="0 0 34 16" aria-hidden="true"><rect x="2" y="2" width="30" height="12" rx="2" style="fill:var(--accent-bg);stroke:var(--accent)" stroke-width="2"/></svg>new code in the MAX scoping work</li>
     </ul>
   </figure>
@@ -183,6 +182,7 @@
   <ul class="facts">
     <li>The MAX graph and <code>max_lower.py</code> are built. A decoder block matches <code>lower.py</code>'s op set exactly and its output bit for bit when the RoPE table is the same.</li>
     <li>TinyLlama, all 22 layers, generated 12 greedy tokens through this path on the host emulator, identical to the fp32 PyTorch reference.</li>
-    <li>Not done: turning the program into a static-shape export, building an <code>.hxb</code>, and running it on the board.</li>
+    <li>On the board, the container built from the MAX programs generates the same 12 tokens as the fp32 reference and as the stock container, at the same speed (about 88 ms per token with fp16 weights). Twelve of its 13 sections are byte for byte the stock container's; the weights arena differs only in the RoPE tables, by at most 2e-5.</li>
+    <li>Not done yet: W4 weights, Qwen3, int8 KV caches, and a longer-prompt check.</li>
   </ul>
 </main>
