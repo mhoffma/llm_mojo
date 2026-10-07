@@ -1,0 +1,9 @@
+Qwen3-0.6B, W4 recipe (k, v, L2.down fp16; Q4_0 ref scales; Q4_0 head), WikiText-2 test, 40 windows of 512 = 20440 targets, DSP
+  stock front end (lower.py)         ppl 29.7425   total NLL 69344.2931
+  MAX, reference RoPE tables         ppl 29.7425   total NLL 69344.2931
+  MAX, MAX's own fp32 RoPE tables    ppl 29.7454   total NLL 69346.2739
+paired differences (same windows):
+  MAX(reference tables) - stock: total NLL +0.0000 nats (+0.00e+00 per token), per-window mean +0.00000 +- 0.00000 (t = +nan); ppl ratio 1.000000
+  MAX(own tables) - MAX(reference tables): total NLL +1.9809 nats (+9.69e-05 per token), per-window mean +0.04952 +- 0.03049 (t = +1.62); ppl ratio 1.000097
+  MAX(own tables) - stock: total NLL +1.9809 nats (+9.69e-05 per token), per-window mean +0.04952 +- 0.03049 (t = +1.62); ppl ratio 1.000097
+  windows where MAX(reference tables) NLL differs from stock's: 0 of 40

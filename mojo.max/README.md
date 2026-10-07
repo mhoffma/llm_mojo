@@ -264,3 +264,32 @@ The table episode is worth remembering: a numerically small difference in a cons
 when the weights are quantized. The MAX path therefore defaults to the reference's tables so its containers can
 be compared with the stock ones token for token. Whether MAX's own table is better or worse for quality is not
 measured (no perplexity run); the two outputs at token 10 are equally plausible.
+
+### Perplexity (Qwen3-0.6B, W4 recipe), on the DSP
+
+Does MAX's own fp32 RoPE table cost quality? `ppl_dsp.py` builds the Generator in a remote session and scores
+WikiText-2 (test split, `hexagon_torch.perplexity`'s protocol) with `Generator.nll`: the first 40 windows of 512
+tokens, 20,440 targets, the same windows for every run. Weights: the recipe above (Q4_0 with llama.cpp's scales,
+`k`, `v`, layer 2's `down` in fp16, W4 head). Per-window NLLs are in `results/q3_ppl_dsp_*.json`; the summary is
+`results/q3_ppl_dsp_summary.txt`.
+
+| Programs from | ppl | total NLL (nats) |
+|---|---|---|
+| stock front end (`lower.py`) | 29.7425 | 69344.2931 |
+| MAX, reference RoPE tables (the default) | **29.7425** | 69344.2931 |
+| MAX, MAX's own fp32 RoPE tables (`--max-tables`) | 29.7454 | 69346.2739 |
+
+- **MAX with the reference tables equals the stock front end exactly** on every one of the 40 windows (not one
+  window's NLL differs, so even the stock layer-0 table quirk changes nothing measurable).
+- **MAX's own table: +1.98 nats over 20,440 tokens**, +9.7e-5 per token, perplexity ratio 1.000097 (+0.01%). Paired
+  per window the mean difference is +0.050 +- 0.030 nats (t = 1.6): not distinguishable from zero with 40 windows.
+  It is far below the cost of Q4_0 itself (several percent, below) and about the size of the fp16 activations'
+  effect that `research/qwen3/mixed_w4.py` quotes (< 0.01%).
+- So the token that flipped at position 10 in the 12-token check was a near-tie, not a quality loss; and MAX's
+  table is, as far as 20k tokens can tell, as good as the reference's. The default stays the reference's tables
+  because they make the MAX containers comparable with the stock ones token for token.
+- 512-token windows give a higher perplexity than the repo's 2048-token figures; only differences between runs on
+  the same windows mean anything.
+
+A CPU study with more windows and fp32 arithmetic (`ppl_cpu.py`: fp32 model; the W4 recipe with the reference
+tables; the same with MAX's tables) is run separately; its results are added when it finishes.
