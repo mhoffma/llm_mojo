@@ -25,8 +25,7 @@ class MaxGenerator(Generator):
     def _program(self, mod, rows, weights="f16", kv8=None):
         if kv8 is not None:
             raise NotImplementedError("int8 KV caches through the MAX front end")
-        if weights not in ("f16",) and not (isinstance(weights, str) and weights == "f16"):
-            raise NotImplementedError("only fp16 weights through the MAX front end so far")
+        policy = weights.at(getattr(mod, "i0", 0)) if isinstance(weights, lower.WeightPolicy) else lower.WeightPolicy(weights)
         cfg = self.m.cfg
         if isinstance(mod, llama.Layers):
             graph, w = build_model.build_layers(self.checkpoint, mod.i0, mod.i1, max_seq=cfg.max_seq)
@@ -36,7 +35,7 @@ class MaxGenerator(Generator):
             graph, w = build_model.build_head(self.checkpoint, max_seq=cfg.max_seq)
         else:
             raise TypeError(type(mod))
-        gm, _ = max_lower.convert(graph, w, t=rows, pos=0, max_seq=cfg.max_seq, batched=True)
+        gm, _ = max_lower.convert(graph, w, t=rows, pos=0, max_seq=cfg.max_seq, batched=True, policy=policy)
         with torch.no_grad():
             low = torch.export.export(gm, (torch.randn(1, rows, cfg.hidden),))
         return Program(self.s, low, memplan.plan_memory(low, self.s.vtcm_bytes, context=self.context), kv8=kv8)

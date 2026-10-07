@@ -1,0 +1,14 @@
+metadata                   174757 bytes  crc same  identical
+weights arena           606371840 bytes  crc DIFFERENT  19865 bytes differ
+head weights             41226240 bytes  crc same  identical
+embedding               131072000 bytes  crc same  identical
+decode schedule             39588 bytes  crc same  identical
+head schedule                 700 bytes  crc same  identical
+prefill schedules         5295824 bytes  crc same  identical
+tag 8                         440 bytes  crc same  identical
+tag 9                        3888 bytes  crc same  identical
+tag 10                         48 bytes  crc same  identical
+prefill placement          439680 bytes  crc same  identical
+extra arenas                12288 bytes  crc same  identical
+prefill patch              244096 bytes  crc same  identical
+containers differ

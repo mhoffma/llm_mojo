@@ -26,6 +26,10 @@ def main():
     p.add_argument("--remote", default=None)
     p.add_argument("--lib-dir", default=None)
     p.add_argument("--skel-hash", default=None)
+    p.add_argument("--weights", default="f16", choices=["f16", "w4f16", "w4f16v2"])
+    p.add_argument("--head-weights", default="f16", choices=["f16", "w4f16", "w4f16v2"])
+    p.add_argument("--keep-f16", default="", help="linears kept fp16 under a W4 --weights: kinds (k), layers (L2), L2.down")
+    p.add_argument("--rounding", default="ref", choices=["ref", "search"])
     p.add_argument("--stock", action="store_true", help="use hexagon_torch's own torch.export front end")
     a = p.parse_args()
     from hexagon_torch import export_blob, generate
@@ -33,8 +37,12 @@ def main():
         import gen_max
         gen_max.MaxGenerator.checkpoint = os.path.abspath(a.model)
         generate.Generator = gen_max.MaxGenerator              # export_blob._export imports it at call time
-    export_blob.export_model(a.model, a.layers, a.out, context=a.context, weights="f16", skel_hash=a.skel_hash,
-                             head_weights="f16", prefill=not a.no_prefill, prefill_rows=a.prefill_rows,
+    weights = a.weights
+    if a.keep_f16 or a.rounding != "ref":
+        from hexagon_torch.lower import WeightPolicy
+        weights = WeightPolicy(a.weights, [k for k in a.keep_f16.split(",") if k], a.rounding)
+    export_blob.export_model(a.model, a.layers, a.out, context=a.context, weights=weights, skel_hash=a.skel_hash,
+                             head_weights=a.head_weights, prefill=not a.no_prefill, prefill_rows=a.prefill_rows,
                              dtype=torch.bfloat16, remote=a.remote, lib_dir=a.lib_dir)
 
 

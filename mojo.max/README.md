@@ -18,8 +18,8 @@ page, generated from it.*
 | S1 | MAX's Llama3 and Qwen3 graphs read into an op table ([`probe_graphs/`](probe_graphs/README.md)) | done |
 | S2 | `max_lower.py`: a Llama3 decoder block equals `lower.py`'s output | done, host emulator |
 | S3a | TinyLlama, 22 layers, 12 greedy tokens equal to the fp32 PyTorch reference | done, host emulator |
-| S3b | static-shape export, memory plan, `.hxb`, run on the DSP | done: 12/12 tokens on the DSP; container equals the stock one except the RoPE tables |
-| later | W4 weights, Qwen3 (per-head RMSNorm, sliced weights), int8 KV caches, ModuleV3 models, longer prompts | open |
+| S3b | static-shape export, memory plan, `.hxb`, run on the DSP | done, fp16 and W4: 12/12 tokens on the DSP; containers equal the stock ones except the RoPE tables |
+| later | Qwen3 (per-head RMSNorm, sliced weights, heads wider than one DSP tensor), int8 KV caches, ModuleV3 models, longer prompts | open |
 
 Last verified 2026-10-07 against `mhoffma/hvxhmx_mojo` `037b8f0` (and a DSP library built from it): `test_max_lower_block.py` 3 passed
 (max |diff| vs `lower.py` 1.95e-3, 92.0% bit-equal; the earlier analysis was against `1706124`).
@@ -164,7 +164,7 @@ a fix to the type parser for dims like `add(n, -1)`.
 
 ---
 
-# S3b: the MAX programs on the DSP (TinyLlama, fp16 weights)
+# S3b: the MAX programs on the DSP (TinyLlama, fp16 and W4 weights)
 
 `gen_max.MaxGenerator` overrides `Generator._program`, which turns a module (layers [i0, i1) or the head)
 into a lowered, planned program for one row count. It builds a MAX graph of the same layers
@@ -182,6 +182,21 @@ six 4-layer prefill programs of 32 rows, the 22-layer decode program, the head, 
 | Tokens on the DSP, prompt "Qualcomm is", 12 greedy | MAX container 12/12 identical to the fp32 PyTorch reference; stock container 12/12 identical too |
 | Speed, 4-token prompt | MAX: TTFT 99-104 ms, decode 87.8-92.7 ms/token (4 runs). Stock: TTFT 98-103 ms, decode 87.6-88.8 ms/token (4 runs). The same schedules: the differences are the shared board's load |
 
+### W4 (Q4_0 weights expanded to fp16 on the DSP; `--weights w4f16v2 --head-weights w4f16v2`)
+
+The converter takes each linear's format from hexagon_torch's `WeightPolicy`, looked up by the name `lower.py`
+would see (`blks.L.attn.q_proj.weight` ...). It knows the role of each linear from the graph (q, k, v from the
+fused QKV that `rope_split_store` splits; gate, up from the `mo.split`; o after attention; down after SwiGLU;
+the head otherwise), so keep-fp16 policies work too.
+
+| Check | Result |
+|---|---|
+| Offline gate, 2 layers, 32 rows and 1 row, policies `f16`, `w4f16v2` and a mixed one (keep `k` and `L1.down` fp16), and the head in `f16` and `w4f16v2` | 8 tests pass: ops, constants (the Q4_0 packed bytes included) and VTCM plans identical; W4 peak 1,589,248 bytes |
+| Containers (`results/s3b_w4_container_compare.txt`) | 748.54 MB each (fp16: 2,104.98 MB); 12 of 13 sections byte-identical, the weights arena (606 MB) differs only in the same 19,865 bytes of RoPE tables |
+| Export | packing 156-198 s on 6 processes; DSP held 66 s (MAX) and 50 s (stock) |
+| Tokens on the DSP, prompt "Qualcomm is", 12 greedy | MAX W4 = stock W4 = the fp32 reference, 12/12 |
+| Speed, 4-token prompt | MAX: TTFT 55-59 ms, decode 46.9-47.4 ms/token (21.1-21.3 tok/s, 3 warm runs; a first cold run 52.0 ms). Stock: TTFT 56-58 ms, decode 47.1-47.6 ms/token. The same speed; 1.9x faster than fp16 |
+
 ## Run it
 
 ```sh
@@ -191,7 +206,7 @@ make -C $HVXHMX_REPO/hmx/layer liblayer_skel.so          # the DSP library; note
 #   (never the shared one on 9870): copy device_control/, write backend/active_backend.mojo as in BUILD.md
 #   section 6.2, build it, then START IT AND KEEP ITS PID:
 #       VQ_SERVER_PORT=9872 HEXAGON_LIB_DIR=... ./server_bin > server.log 2>&1 & echo $! > server.pid
-python export_mojomax.py --model <TinyLlama dir> --out x.hxb --remote tcp://10.168.168.32:9872 \
+python export_mojomax.py --model <TinyLlama dir> --weights w4f16v2 --head-weights w4f16v2 --out x.hxb --remote tcp://10.168.168.32:9872 \
     --lib-dir /home/mhoffman/hexagon/mojomax/lib --skel-hash <sha256>        # waits while another user holds the DSP
 scp x.hxb vq:hexagon/mojomax/exports/
 python run_dsp.py --container /home/mhoffman/hexagon/mojomax/exports/x.hxb --skel <sha256> --port 9872 --model <dir>
@@ -206,7 +221,7 @@ PID when you start a process and kill that PID.
 
 ## Limits
 
-- fp16 weights only (`MaxGenerator` refuses W4 policies); no int8 KV; the head must fit one DSP tensor
+- fp16 and Q4_0 weights (fp16 or W4 head); no int8 KV; the head must fit one DSP tensor
   (vocabulary <= 32,768; TinyLlama's is 32,000); one prompt of 4 tokens and 12 generated tokens.
 - The test runs against a DSP library built from the same `hvxhmx_mojo` commit as the Python side; a library
   built from a different commit may not match the container's patch tables.

@@ -30,7 +30,7 @@ if HVXHMX and HVXHMX not in sys.path:
     sys.path.insert(0, HVXHMX)
 
 from hexagon_torch import layouts, lower, ops  # noqa: E402  (registers torch.ops.hexagon.*)
-from hexagon_torch.pack import LAYOUT_VERSION, pack_linear_f16, pack_rms_norm  # noqa: E402
+from hexagon_torch.pack import LAYOUT_VERSION, pack_linear_f16, pack_linear_w4, pack_rms_norm  # noqa: E402
 
 aten, H = torch.ops.aten, torch.ops.hexagon
 _NP = {"f32": np.float32, "f64": np.float64, "f16": np.float16, "si64": np.int64, "ui32": np.uint32,
@@ -101,10 +101,13 @@ def _fold(name, op, ins, shape, dt):
 
 
 class Converter:
-    def __init__(self, graph, weights, t=None, pos=None, max_seq=256, batched=False, exact_tables=False):
+    def __init__(self, graph, weights, t=None, pos=None, max_seq=256, batched=False, exact_tables=False, policy=None):
         """t, pos: ints bake the sequence length / position into the program (S2); None makes them
         runtime: the program is forward(x, pos) and t is the number of rows of x."""
         self.g, self.weights, self.t, self.pos, self.max_seq = graph, weights, t, pos, max_seq
+        self.policy = policy or lower.WeightPolicy("f16")   # a format per linear, by layer and kind (lower.WeightPolicy)
+        self.cur_layer = None       # the layer being converted (set by its attention ops)
+        self.origin = {}            # fx node -> "o" (attention output) | "down" (SwiGLU output): names the matmul after it
         self.exact_tables = exact_tables   # fold MAX's cos/sin chain in fp64 (hexagon_torch's reference tables)
         self.batched = batched      # hidden input / output as [1, t, features] (a torch module's), t static
         self.fx = torch.fx.Graph()
@@ -273,18 +276,28 @@ class Converter:
         g = self.buffer("gamma", torch.from_numpy(p.gamma.copy()))
         self.val[res[0]] = ("fx", self.call(H.rms_norm.default, self.node(ins[0]), g, eps, p.k, LAYOUT_VERSION))
 
-    def pack(self, w_out_in):
-        """pack_linear_f16, through hexagon_torch's pack cache when one is open (lower.pack_cache():
-        Generator opens one and fills it from worker processes before the programs are built)."""
+    def target(self, kind):
+        """The name lower.py's WeightPolicy sees for a linear of the current layer: blks.L.attn.q_proj.weight ..."""
+        if kind == "lm_head":
+            return "lm_head.weight"
+        part = "attn" if kind in ("q", "k", "v", "o") else "mlp"
+        return f"blks.{self.cur_layer}.{part}.{kind}_proj.weight"
+
+    def pack(self, w_out_in, target):
+        """The linear's packing in the format the policy gives its name (f16, or Q4_0 expanded on the DSP),
+        through hexagon_torch's pack cache when one is open (lower.pack_cache(): Generator opens one and
+        fills it from worker processes before the programs are built; same keys as lower._Lowering.pack)."""
+        fmt, rounding = self.policy(target), self.policy.rounding
+        make = lambda: (pack_linear_w4(w_out_in, None, fmt, rounding) if fmt != "f16" else pack_linear_f16(w_out_in, None))
         if lower._cache is None:
-            return pack_linear_f16(w_out_in, None)
-        key = lower.fingerprint(w_out_in, None, ("f16", "ref"))
+            return make()
+        key = lower.fingerprint(w_out_in, None, (fmt, rounding))
         if key not in lower._cache:
-            lower.cache_put(key, pack_linear_f16(w_out_in, None))
+            lower.cache_put(key, make())
         return lower._cache[key]
 
-    def linear(self, x, w_out_in):
-        p = self.pack(w_out_in)
+    def linear(self, x, w_out_in, kind):
+        p = self.pack(w_out_in, self.target(kind))
         wn = self.buffer("w", torch.from_numpy(p.weights.copy()))
         bn = self.buffer("bt", torch.from_numpy(p.bias_table.view(np.int32).copy()))
         return self.call(H.linear.default, x, wn, bn, p.fmt, p.k, p.n, LAYOUT_VERSION)
@@ -298,7 +311,7 @@ class Converter:
         kind, x = self.val[v]
         if kind == "matmul":
             xin, w = x
-            node = self.linear(xin, np.ascontiguousarray(w.T))
+            node = self.linear(xin, np.ascontiguousarray(w.T), self.origin.get(xin, "lm_head"))
             self.val[v] = ("fx", node)
             return node
         return self.node(v)
@@ -307,9 +320,12 @@ class Converter:
         kind, (xin, w) = self.val[ins[0]]
         assert kind == "matmul", "split of a non-matmul"
         sizes = [_type(r)[0][-1] for r in res]
+        kinds = {2: ("gate", "up")}.get(len(res))
+        if kinds is None:
+            raise NotImplementedError(f"a {len(res)}-way split of a matmul")
         off = 0
-        for r, n in zip(res, sizes):
-            self.val[r] = ("fx", self.linear(xin, np.ascontiguousarray(w[:, off:off + n].T)))
+        for r, n, kind in zip(res, sizes, kinds):
+            self.val[r] = ("fx", self.linear(xin, np.ascontiguousarray(w[:, off:off + n].T), kind))
             off += n
 
     def op_rmo_mo_silu(self, o, ins, res):
@@ -325,7 +341,9 @@ class Converter:
             gate, up = b[1], self.materialize(ins[0])
         else:
             raise NotImplementedError("mul that is not silu(gate) * up")
-        self.val[res[0]] = ("fx", self.call(H.swiglu.default, gate, up, LAYOUT_VERSION))
+        y = self.call(H.swiglu.default, gate, up, LAYOUT_VERSION)
+        self.origin[y] = "down"
+        self.val[res[0]] = ("fx", y)
 
     def fold_default(self, o, ins, res):
         shape, dt = _type(res[0])
@@ -361,9 +379,10 @@ class Converter:
         sin = np.ascontiguousarray(freqs[:self.max_seq, 1::2], np.float32)
         ct, st = self.buffer("cos", torch.from_numpy(cos)), self.buffer("sin", torch.from_numpy(sin))
         qn, kn = n_q * hd, n_kv * hd
-        q = self.linear(xin, np.ascontiguousarray(w[:, :qn].T))
-        k = self.linear(xin, np.ascontiguousarray(w[:, qn:qn + kn].T))
-        v = self.linear(xin, np.ascontiguousarray(w[:, qn + kn:qn + 2 * kn].T))
+        self.cur_layer = int(self.const(ins[8]))
+        q = self.linear(xin, np.ascontiguousarray(w[:, :qn].T), "q")
+        k = self.linear(xin, np.ascontiguousarray(w[:, qn:qn + kn].T), "k")
+        v = self.linear(xin, np.ascontiguousarray(w[:, qn + kn:qn + 2 * kn].T), "v")
         t = self.t
         q = self.call(H.rope.default, q, ct, st, self.pos, t, hd, LAYOUT_VERSION)
         k = self.call(H.rope.default, k, ct, st, self.pos, t, hd, LAYOUT_VERSION)
@@ -384,6 +403,7 @@ class Converter:
         kc, vc = self.cache_nodes[int(self.const(ins[7]))]
         y = self.call(H.scaled_dot_product_attention.default, self.node(ins[0]), kc, vc, self.pos,
                       self.n_heads, self.n_kv, self.hd, self.max_seq, True, scale, LAYOUT_VERSION)
+        self.origin[y] = "o"
         self.val[res[0]] = ("fx", y)
 
     # ---- result
@@ -404,11 +424,11 @@ def _type_buffer(v):
     return [int(d) if d.strip().isdigit() else d.strip() for d in m.group(1).split(",")]
 
 
-def convert(graph, weights, t=None, pos=None, max_seq=256, batched=False, exact_tables=False):
+def convert(graph, weights, t=None, pos=None, max_seq=256, batched=False, exact_tables=False, policy=None):
     """MAX Graph (one block: input [t, hidden], kv inputs) -> (GraphModule of hexagon ops, op counts).
     The module takes x [t, hidden] fp32 and returns [t, hidden] fp32; its packed KV caches are the
     buffers named in `gm.caches`."""
-    c = Converter(graph, weights, t, pos, max_seq, batched, exact_tables)
+    c = Converter(graph, weights, t, pos, max_seq, batched, exact_tables, policy)
     gm, counts = c.run()
     gm.caches = c.caches if len(c.caches) != 1 else {"k": c.caches[0][0], "v": c.caches[0][1]}
     gm.layer_caches = c.caches

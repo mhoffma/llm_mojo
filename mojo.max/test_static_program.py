@@ -60,23 +60,34 @@ def describe(ep):
     return out
 
 
-def mine(model, graph_fn, rows, exact_tables=True):
+WEIGHTS = {"f16": lambda: "f16", "w4f16v2": lambda: "w4f16v2",
+           "w4_mixed": lambda: lower.WeightPolicy("w4f16v2", keep=("k", "L1.down"))}     # (a policy per call: .at() is pure)
+
+
+def policy_of(weights):
+    return weights if isinstance(weights, lower.WeightPolicy) else lower.WeightPolicy(weights)
+
+
+def mine(model, graph_fn, rows, weights="f16", exact_tables=True):
     graph, w = graph_fn()
-    gm, _ = max_lower.convert(graph, w, t=rows, pos=0, max_seq=MAX_SEQ, batched=True, exact_tables=exact_tables)
+    gm, _ = max_lower.convert(graph, w, t=rows, pos=0, max_seq=MAX_SEQ, batched=True, exact_tables=exact_tables,
+                              policy=policy_of(weights))
     with torch.no_grad():
         return torch.export.export(gm, (torch.randn(1, rows, model.cfg.hidden),))
 
 
-def theirs(model, rows, mod):
+def theirs(model, rows, mod, weights="f16"):
     with torch.no_grad():
-        return lower.lower(torch.export.export(mod, (torch.randn(1, rows, model.cfg.hidden),)))
+        return lower.lower(torch.export.export(mod, (torch.randn(1, rows, model.cfg.hidden),)), weights=weights)
 
 
+@pytest.mark.parametrize("wname", list(WEIGHTS))
 @pytest.mark.parametrize("rows", [32, 1])
-def test_layers_program_equals_lower_py(model, rows):
+def test_layers_program_equals_lower_py(model, rows, wname):
+    weights = WEIGHTS[wname]()
     with lower.pack_cache():
-        a = mine(model, lambda: build_model.build_layers(CKPT, 0, LAYERS, MAX_SEQ), rows)
-        b = theirs(model, rows, llama.Layers(model, 0, LAYERS))
+        a = mine(model, lambda: build_model.build_layers(CKPT, 0, LAYERS, MAX_SEQ), rows, weights)
+        b = theirs(model, rows, llama.Layers(model, 0, LAYERS), weights)
     da, db = describe(a), describe(b)
     assert len(da) == len(db), (len(da), len(db))
     for i, (x, y) in enumerate(zip(da, db)):
@@ -96,13 +107,14 @@ def test_layers_program_equals_lower_py(model, rows):
     assert len(rope_tables(pb)) - len(rope_tables(pa)) == 2 * LAYERS, (len(rope_tables(pa)), len(rope_tables(pb)))
     rest = lambda p: [(r.kind, r.place, r.offset, r.bytes) for r in p.regions if r not in rope_tables(p)]
     assert rest(pa) == rest(pb)
-    print(f"\nrows {rows}: {len(da)} hexagon ops identical, constants identical, plan peak {pa.peak} bytes of VTCM")
+    print(f"\n{wname}, rows {rows}: {len(da)} hexagon ops identical, constants identical, plan peak {pa.peak} bytes of VTCM")
 
 
-def test_head_program_equals_lower_py(model):
-    rows = 1
+@pytest.mark.parametrize("wname", ["f16", "w4f16v2"])
+def test_head_program_equals_lower_py(model, wname):
+    rows, weights = 1, WEIGHTS[wname]()
     with lower.pack_cache():
-        a = mine(model, lambda: build_model.build_head(CKPT, MAX_SEQ), rows)
-        b = theirs(model, rows, llama.Head(model))
+        a = mine(model, lambda: build_model.build_head(CKPT, MAX_SEQ), rows, weights)
+        b = theirs(model, rows, llama.Head(model), weights)
     assert describe(a) == describe(b)
     assert memplan.plan_memory(a, 8 << 20).peak == memplan.plan_memory(b, 8 << 20).peak
